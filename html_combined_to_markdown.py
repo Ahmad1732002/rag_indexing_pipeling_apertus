@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+Convert HTML files from html_combined directory to markdown files.
+Filters domains based on Excel sheet and maintains folder structure.
+Creates one markdown file per HTML page.
+"""
+
+import os
+import json
+import gzip
+from pathlib import Path
+from tqdm import tqdm
+import pandas as pd
+from html_to_markdown import convert_to_markdown
+
+
+def get_base_site_from_url(url_in):
+    """
+    Extracts the base site from the given URL.
+    Example: "http://ethz.ch/about/test.png" returns "ethz.ch"
+
+    Args:
+        url_in (str): The url to find the base site for.
+
+    Returns:
+        str: Base Url
+    """
+    if "//" not in url_in:
+        base_site = url_in
+    else:
+        url_in_old = url_in
+        base_site = url_in.split("//")[1]
+        if base_site == "http:":
+            print(f"This url is oddly formed: {url_in_old}")
+            base_site = url_in_old.split("//")[2]
+
+    # various artefacts found in the warc files
+    base_site = base_site.replace("dns:", "")
+    base_site = base_site.replace("mailto:", "")
+    base_site = base_site.replace("www.", "")
+    base_site = base_site.replace("www0.", "")
+    base_site = base_site.replace("www1.", "")
+    base_site = base_site.replace("www2.", "")
+    base_site = base_site.replace("www3.", "")
+    base_site = base_site.split(":")[0]
+    base_site = base_site.split("/")[0]
+
+    if base_site[-1] == ".":
+        base_site = base_site[:-1]
+
+    return base_site
+
+
+def get_base_url_from_url(url_in):
+    """
+    Extracts the base URL (protocol + domain) from a full URL.
+    Example: "https://ethz.ch/de/about/test.html" returns "https://ethz.ch"
+
+    Args:
+        url_in (str): The full URL
+
+    Returns:
+        str: Base URL with protocol and domain only
+    """
+    if "//" not in url_in:
+        return url_in
+
+    # Split into protocol and rest
+    parts = url_in.split("//")
+    protocol = parts[0] + "//"
+
+    # Get domain from the rest (everything before first /)
+    rest = parts[1]
+    domain = rest.split("/")[0]
+
+    return protocol + domain
+
+
+def load_allowed_domains(excel_path):
+    """
+    Load allowed domains from Excel file.
+
+    Args:
+        excel_path (str): Path to Excel file with URL column
+
+    Returns:
+        set: Set of allowed base domains
+    """
+    df = pd.read_excel(excel_path)
+    df = df.fillna("")
+    urls = list(df["URL"])
+
+    allowed_domains = set()
+    for url in urls:
+        if url != "":
+            base_site = get_base_site_from_url(url)
+            allowed_domains.add(base_site)
+
+    print(f"Loaded {len(allowed_domains)} allowed domains from Excel")
+    return allowed_domains
+
+
+def convert_html_to_markdown(html_path, output_path):
+    """
+    Convert a single HTML file to markdown.
+
+    Args:
+        html_path (Path): Path to HTML file
+        output_path (Path): Path where markdown should be saved
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Read HTML file (handle both regular and gzipped)
+        if str(html_path).endswith('.gz'):
+            with gzip.open(html_path, 'rb') as f:
+                html_content = f.read()
+        else:
+            try:
+                with open(html_path, 'r', encoding='utf-8') as f:
+                    html_content = f.read()
+            except UnicodeDecodeError:
+                with open(html_path, 'r', encoding='unicode_escape') as f:
+                    html_content = f.read()
+
+        if not html_content or html_content == "":
+            return False
+
+        # Convert to markdown
+        markdown_text = convert_to_markdown(str(html_content))
+
+        # Skip empty or redirect-only files
+        if markdown_text in ("", "Redirecting"):
+            return False
+
+        # Create output directory if needed
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write markdown file
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(markdown_text)
+
+        return True
+
+    except Exception as e:
+        print(f"Error processing {html_path}: {e}")
+        return False
+
+
+def convert_html_combined_to_markdown(
+    input_dir,
+    output_dir,
+    excel_path=None,
+    mappings_path=None,
+    filenames_to_remove=[
+        "impressum", "datenschutz", "kontakt", "robots",
+        "imprint", "data-protection", "contact", "copyright",
+    ]
+):
+    """
+    Convert HTML files from html_combined directory to markdown files.
+    Creates one markdown file per HTML page, maintaining folder structure.
+
+    Args:
+        input_dir (str): Path to html_combined directory
+        output_dir (str): Path where markdown files should be saved
+        excel_path (str, optional): Path to Excel file with URL column to filter domains.
+            If None, processes all domains.
+        mappings_path (str, optional): Path to save domain->URL mappings JSON file
+        filenames_to_remove (list): Keywords that if found in filename, file is skipped
+
+    Returns:
+        dict: Summary with 'domains_processed', 'files_converted', 'files_skipped'
+    """
+    print("=" * 70)
+    print("HTML to Markdown Converter")
+    print("=" * 70)
+    print(f"Input:  {input_dir}")
+    print(f"Output: {output_dir}")
+    if excel_path:
+        print(f"Excel:  {excel_path}")
+    print("=" * 70)
+
+    # Load allowed domains from Excel if provided
+    allowed_domains = None
+    if excel_path:
+        allowed_domains = load_allowed_domains(excel_path)
+
+    # Load full URLs for mapping if needed
+    domain_mappings = {}
+    if mappings_path and excel_path:
+        df = pd.read_excel(excel_path)
+        df = df.fillna("")
+        urls = list(df["URL"])
+
+        for url in urls:
+            if url != "":
+                base_site = get_base_site_from_url(url)
+                if base_site not in domain_mappings:
+                    # Store only the base URL (protocol + domain), not the full path
+                    domain_mappings[base_site] = get_base_url_from_url(url)
+
+        # Save mappings
+        mappings_path_obj = Path(mappings_path)
+        mappings_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        with open(mappings_path, 'w', encoding='utf-8') as f:
+            json.dump(domain_mappings, f, indent=2)
+        print(f"Saved domain mappings to {mappings_path}")
+
+    # Process files
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+
+    files_converted = 0
+    files_skipped = 0
+    domains_processed = set()
+
+    # Walk through all domain folders in html_combined
+    domain_folders = [d for d in input_path.iterdir() if d.is_dir()]
+
+    print(f"\nProcessing {len(domain_folders)} domain folders...")
+    print("=" * 70)
+
+    for domain_folder in tqdm(domain_folders, desc="Processing domains", unit="domain"):
+        domain = domain_folder.name
+
+        # Check if domain is in allowed list (if filtering is enabled)
+        if allowed_domains is not None and domain not in allowed_domains:
+            continue
+
+        domains_processed.add(domain)
+
+        # Walk through all HTML files in this domain folder
+        for html_file in domain_folder.rglob('*'):
+            if not html_file.is_file():
+                continue
+
+            # Check if it's an HTML file
+            if not (html_file.suffix in ['.html', '.htm'] or str(html_file).endswith('.html.gz')):
+                continue
+
+            # Check if filename should be skipped
+            skip_file = False
+            for keyword in filenames_to_remove:
+                if keyword in html_file.name.lower():
+                    skip_file = True
+                    files_skipped += 1
+                    break
+
+            if skip_file:
+                continue
+
+            # Calculate relative path from domain folder
+            rel_path = html_file.relative_to(domain_folder)
+
+            # Create output path (change extension to .md)
+            if str(html_file).endswith('.html.gz'):
+                md_filename = html_file.name.replace('.html.gz', '.md')
+            else:
+                md_filename = html_file.stem + '.md'
+
+            output_file_path = output_path / domain / rel_path.parent / md_filename
+
+            # Convert HTML to markdown
+            if convert_html_to_markdown(html_file, output_file_path):
+                files_converted += 1
+            else:
+                files_skipped += 1
+
+    print("\n" + "=" * 70)
+    print(f"✓ Processed {len(domains_processed)} domains")
+    print(f"✓ Converted {files_converted} files")
+    print(f"✓ Skipped {files_skipped} files")
+    print(f"✓ Output directory: {output_dir}")
+    print("=" * 70)
+
+    return {
+        'domains_processed': len(domains_processed),
+        'files_converted': files_converted,
+        'files_skipped': files_skipped,
+        'domains': sorted(list(domains_processed))
+    }
+
+
+def main():
+    """Main function with default paths."""
+    input_dir = "output/html_combined"
+    output_dir = "output/markdown"
+    excel_path = "data/2025-11-20_19945_topics.xlsx"
+    mappings_path = "output/domain_mappings.json"
+
+    convert_html_combined_to_markdown(
+        input_dir,
+        output_dir,
+        excel_path=excel_path,
+        mappings_path=mappings_path
+    )
+
+
+if __name__ == "__main__":
+    main()
