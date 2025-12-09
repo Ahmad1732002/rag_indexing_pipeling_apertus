@@ -103,6 +103,75 @@ The pipeline processes files from `./data/ethz_websites_2022-2025_examples/` and
 python run_query.py
 ```
 
+## Running on CSCS Cluster (No GPU)
+
+The CSCS cluster requires that your environment be packaged into a SquashFS container (.sqsh) using Podman and Enroot. This section outlines the build and deployment process for running your job via sbatch.
+
+### Step 1: Build the Container Image
+
+This step is performed once from a compute node to create the container file (ethz_cpu_rag.sqsh).
+
+**a. Save the Dockerfile:** Ensure the Dockerfile (containing your Python dependencies) is saved in your project root.
+
+**b. Get a Compute Node:** Request an interactive shell session.
+
+```bash
+srun --nodes=1 --time=01:00:00 --partition=normal --account=large-sc-2 --container-writable --pty bash
+```
+
+**c. Navigate to Project:** Go to the directory containing your Dockerfile.
+
+```bash
+cd /iopsstor/scratch/cscs/$USER/path/to/project/
+```
+
+**d. Build the Image (Podman):** This reads the Dockerfile and creates a local image.
+
+```bash
+podman build -t ethz_cpu_rag:v1 .
+```
+
+**e. Convert to SquashFS (Enroot):** This creates the final, runnable container file (.sqsh).
+
+```bash
+enroot import -o ethz_cpu_rag.sqsh podman://ethz_cpu_rag:v1
+```
+
+**f. Exit:**
+
+```bash
+exit
+```
+
+### Step 2: Create the Enroot TOML Configuration
+
+Create a configuration file to tell the cluster environment how to run your .sqsh container. This file must be placed in your dedicated Enroot configuration directory.
+
+Create the file `~/.edf/rag_env.toml` (using the path to your new container):
+
+```toml
+# ~/.edf/rag_env.toml
+image = "/iopsstor/scratch/cscs/<your_username>/path/to/project/ethz_cpu_rag.sqsh"
+mounts = [
+    # Mount your scratch directory so the container can access inputs/outputs
+    "/iopsstor/scratch/cscs/<your_username>:/iopsstor/scratch/cscs/<your_username>"
+]
+writable = true
+```
+
+**Note:** Replace `<your_username>` and the project path with your actual details.
+
+### Step 3: Run the Indexing Job
+
+Submit your sbatch script ([run_pipeline.sbatch](run_pipeline.sbatch)), passing the container configuration name and the required input paths.
+
+```bash
+sbatch run_pipeline.sbatch \
+    --container-name=rag_env \
+    /iopsstor/scratch/cscs/$USER/data/warc_files \
+    /iopsstor/scratch/cscs/$USER/config/topics.xlsx
+```
+
 ## Project Structure
 
 ```
