@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 import json
+import pandas as pd
 
 
 def extract_timestamp_and_domain(folder_name):
@@ -45,9 +46,68 @@ def extract_timestamp_and_domain(folder_name):
         return None, domain
 
 
-def scan_html_folders(input_dir):
+def get_base_site_from_url(url_in):
+    """
+    Extracts the base site from the given URL.
+    Example: "http://ethz.ch/about/test.png" returns "ethz.ch"
+    """
+    if "//" not in url_in:
+        base_site = url_in
+    else:
+        url_in_old = url_in
+        base_site = url_in.split("//")[1]
+        if base_site == "http:":
+            print(f"This url is oddly formed: {url_in_old}")
+            base_site = url_in_old.split("//")[2]
+
+    base_site = base_site.replace("dns:", "")
+    base_site = base_site.replace("mailto:", "")
+    base_site = base_site.replace("www.", "")
+    base_site = base_site.replace("www0.", "")
+    base_site = base_site.replace("www1.", "")
+    base_site = base_site.replace("www2.", "")
+    base_site = base_site.replace("www3.", "")
+    base_site = base_site.split(":")[0]
+    base_site = base_site.split("/")[0]
+
+    if base_site[-1] == ".":
+        base_site = base_site[:-1]
+
+    return base_site
+
+
+def load_allowed_domains(excel_path):
+    """
+    Load allowed domains from Excel file.
+
+    Args:
+        excel_path (str): Path to Excel file with URL column
+
+    Returns:
+        set: Set of allowed base domains
+    """
+    df = pd.read_excel(excel_path)
+    df = df.fillna("")
+    urls = list(df["URL"])
+
+    allowed_domains = set()
+    for url in urls:
+        if url != "":
+            base_site = get_base_site_from_url(url)
+            allowed_domains.add(base_site)
+
+    print(f"Loaded {len(allowed_domains)} allowed domains from Excel")
+    return allowed_domains
+
+
+def scan_html_folders(input_dir, allowed_domains=None):
     """
     Scan all folders and organize by domain.
+
+    Args:
+        input_dir (str): Directory containing WARC extraction folders
+        allowed_domains (set, optional): Set of allowed domains to filter by
+
     Returns: dict mapping domain -> list of (timestamp, folder_path) tuples
     """
     domain_folders = defaultdict(list)
@@ -63,8 +123,12 @@ def scan_html_folders(input_dir):
 
         timestamp, domain = extract_timestamp_and_domain(folder.name)
         if domain:
-            domain_folders[domain].append((timestamp, folder))
-            print(f"Found: {domain} - {timestamp} - {folder.name}")
+            # Filter by allowed domains if provided
+            if allowed_domains is None or domain in allowed_domains:
+                domain_folders[domain].append((timestamp, folder))
+                print(f"Found: {domain} - {timestamp} - {folder.name}")
+            else:
+                print(f"Skipping (not in Excel): {domain} - {folder.name}")
 
     return domain_folders
 
@@ -109,7 +173,7 @@ def combine_domain_folders(domain, folder_list, output_dir):
             # If we haven't seen this file yet, or this version is newer
             if relative_path not in file_registry:
                 file_registry[relative_path] = (timestamp, absolute_path)
-                print(f"  + {relative_path} (from {timestamp})")
+                # print(f"  + {relative_path} (from {timestamp})")
             else:
                 existing_timestamp, _ = file_registry[relative_path]
 
@@ -118,10 +182,10 @@ def combine_domain_folders(domain, folder_list, output_dir):
                     continue
                 if existing_timestamp is None:
                     file_registry[relative_path] = (timestamp, absolute_path)
-                    print(f"  ↑ {relative_path} (updated to {timestamp})")
+                    # print(f"  ↑ {relative_path} (updated to {timestamp})")
                 elif timestamp > existing_timestamp:
                     file_registry[relative_path] = (timestamp, absolute_path)
-                    print(f"  ↑ {relative_path} (updated: {existing_timestamp} -> {timestamp})")
+                    # print(f"  ↑ {relative_path} (updated: {existing_timestamp} -> {timestamp})")
 
     # Copy all selected files to output directory and build metadata
     print(f"\n  Copying {len(file_registry)} files to {output_path}")
@@ -141,7 +205,7 @@ def combine_domain_folders(domain, folder_list, output_dir):
     return len(file_registry), timestamp_metadata
 
 
-def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=None):
+def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=None, excel_path=None):
     """
     Combine HTML files from multiple WARC extractions by domain.
     For files that exist in multiple folders (same domain, same path),
@@ -152,6 +216,8 @@ def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=Non
         output_dir (str): Directory where combined results will be saved (e.g., "output/html_combined")
         timestamps_json_path (str, optional): Path to save file timestamp metadata JSON.
             If None, saves to "{output_dir}_timestamps.json"
+        excel_path (str, optional): Path to Excel file with URL column to filter domains.
+            If None, processes all domains.
 
     Returns:
         dict: Summary with keys 'domains_count', 'total_files', 'domains', and 'timestamps_file'
@@ -161,10 +227,17 @@ def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=Non
     print("=" * 70)
     print(f"Input:  {input_dir}")
     print(f"Output: {output_dir}")
+    if excel_path:
+        print(f"Excel:  {excel_path}")
     print("=" * 70)
 
+    # Load allowed domains from Excel if provided
+    allowed_domains = None
+    if excel_path:
+        allowed_domains = load_allowed_domains(excel_path)
+
     # Scan folders and organize by domain
-    domain_folders = scan_html_folders(input_dir)
+    domain_folders = scan_html_folders(input_dir, allowed_domains)
 
     if not domain_folders:
         print("\nNo valid folders found!")

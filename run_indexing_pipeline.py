@@ -93,7 +93,8 @@ def main():
         combine_domains_by_timestamp(
             input_dir=html_raw_dir,
             output_dir=html_combined_dir,
-            timestamps_json_path=timestamps_json_path
+            timestamps_json_path=timestamps_json_path,
+            excel_path=topics_excel_path
         )
         convert_html_combined_to_markdown(
             input_dir=html_combined_dir,
@@ -106,7 +107,8 @@ def main():
         combine_domains_by_timestamp(
             input_dir=pdf_raw_dir,
             output_dir=pdf_combined_dir,
-            timestamps_json_path=timestamps_json_path
+            timestamps_json_path=timestamps_json_path,
+            excel_path=topics_excel_path
         )
         convert_pdf_combined_to_markdown(
             input_dir=pdf_combined_dir,

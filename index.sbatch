@@ -4,8 +4,8 @@
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=32
+#SBATCH --time=16:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/rag_project/logs/output_%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/rag_project/logs/output_%j.err
 #SBATCH --environment=indexing_pipeline 
