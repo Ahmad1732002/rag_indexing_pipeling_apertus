@@ -107,14 +107,6 @@ def load_allowed_domains(excel_path):
 def convert_html_to_markdown(html_path, output_path, create_dirs=True):
     """
     Convert a single HTML file to markdown.
-
-    Args:
-        html_path (Path): Path to HTML file
-        output_path (Path): Path where markdown should be saved
-        create_dirs (bool): Whether to create directories (set False if pre-created)
-
-    Returns:
-        bool: True if successful, False otherwise
     """
     try:
         # Read HTML file (handle both regular and gzipped)
@@ -129,23 +121,25 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
                 with open(html_path, 'r', encoding='unicode_escape') as f:
                     html_content = f.read()
 
-        if not html_content or html_content == "":
+        if not html_content:
             return False
 
-        # Sanitize HTML content to avoid Rust panics on invalid UTF-8
+        # 1. AGGRESSIVE SANITIZATION
+        # Ensure we have a string, ignoring invalid utf-8 sequences that might trip Rust
         if isinstance(html_content, bytes):
-            # Decode with error handling - replace invalid UTF-8 sequences
-            html_content = html_content.decode('utf-8', errors='replace')
+            html_content = html_content.decode('utf-8', errors='ignore')
         else:
-            # Ensure string is valid UTF-8
-            html_content = str(html_content).encode('utf-8', errors='replace').decode('utf-8')
+            # If it's already a string, encode and decode to strip "surrogates" 
+            # or other weird python-specific string artifacts
+            html_content = html_content.encode('utf-8', errors='ignore').decode('utf-8')
 
-        # Convert to markdown (with error handling for Rust panics)
+        # 2. ROBUST CONVERSION WITH BASEEXCEPTION CATCHING
         try:
             markdown_text = convert_to_markdown(html_content)
-        except Exception:
-            # Rust library can panic on malformed UTF-8 or invalid HTML
-            # Skip these files silently to avoid crashing the entire pipeline
+        except BaseException as e: 
+            # CRITICAL FIX: 'BaseException' catches pyo3_runtime.PanicException
+            # 'Exception' does not always catch Rust panics
+            print(f"⚠ Rust panic on file {html_path.name}: {e}")
             return False
 
         # Skip empty or redirect-only files
@@ -163,7 +157,7 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
         return True
 
     except Exception as e:
-        # Silently skip files with errors to keep pipeline running
+        print(f"General error on {html_path}: {e}")
         return False
 
 
@@ -341,6 +335,10 @@ def convert_html_combined_to_markdown(
 
     # Walk through all domain folders in html_combined
     domain_folders = [d for d in input_path.iterdir() if d.is_dir()]
+
+    # --- 🚨 QUICK FIX: Filter out crashing domain ---
+    domain_folders = [d for d in domain_folders if d.name != "polyphys.mat.ethz.ch"]
+    print("⚠ Explicitly skipping crashing domain: polyphys.mat.ethz.ch")
 
     # Filter domains if allowed_domains is provided
     if allowed_domains is not None:
