@@ -90,7 +90,7 @@ def convert_pdf_to_markdown(pdf_path, output_path, create_dirs=True):
         create_dirs (bool): Whether to create directories (set False if pre-created)
 
     Returns:
-        bool: True if successful, False otherwise
+        str: 'converted' if successful, 'skipped' if intentionally skipped, 'failed' if error
     """
     try:
         import fitz  # PyMuPDF
@@ -105,7 +105,7 @@ def convert_pdf_to_markdown(pdf_path, output_path, create_dirs=True):
 
         if pdf_doc.page_count == 0:
             pdf_doc.close()
-            return False
+            return 'skipped'  # Empty PDF - intentional skip
 
         # Extract text from all pages
         text_parts = []
@@ -127,7 +127,7 @@ def convert_pdf_to_markdown(pdf_path, output_path, create_dirs=True):
 
         # Skip empty files
         if not pdf_text or pdf_text == "":
-            return False
+            return 'skipped'  # No extractable text - intentional skip
 
         # Create output directory if needed
         if create_dirs:
@@ -139,11 +139,10 @@ def convert_pdf_to_markdown(pdf_path, output_path, create_dirs=True):
             f.write(f"# PDF Document: {pdf_path.name}\n\n")
             f.write(pdf_text)
 
-        return True
+        return 'converted'  # Success
 
     except Exception as e:
-        print(f"Error processing {pdf_path}: {e}")
-        return False
+        return 'failed'  # General error - conversion failure
 
 
 def process_single_pdf_file(args):
@@ -154,7 +153,7 @@ def process_single_pdf_file(args):
         args: Tuple of (pdf_file, domain_folder, output_path, filenames_to_remove)
 
     Returns:
-        tuple: (status, count) where status is 'converted' or 'skipped'
+        tuple: (status, count) where status is 'converted', 'skipped', or 'failed'
     """
     pdf_file, domain_folder, output_path, filenames_to_remove = args
 
@@ -175,10 +174,8 @@ def process_single_pdf_file(args):
     output_file_path = output_path / domain_folder.name / rel_path.parent / md_filename
 
     # Convert PDF to markdown (dirs already created in batch)
-    if convert_pdf_to_markdown(pdf_file, output_file_path, create_dirs=False):
-        return ('converted', 1)
-    else:
-        return ('skipped', 1)
+    status = convert_pdf_to_markdown(pdf_file, output_file_path, create_dirs=False)
+    return (status, 1)
 
 
 def process_domain_parallel(domain_folder, input_path, output_path, allowed_domains, filenames_to_remove, max_workers=None):
@@ -194,13 +191,13 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
         max_workers (int, optional): Number of thread workers for file I/O. If None, uses CPU count.
 
     Returns:
-        dict: Results with 'domain', 'converted', 'skipped' counts
+        dict: Results with 'domain', 'converted', 'skipped', 'failed' counts
     """
     domain = domain_folder.name
 
     # Check if domain is in allowed list (if filtering is enabled)
     if allowed_domains is not None and domain not in allowed_domains:
-        return {'domain': domain, 'converted': 0, 'skipped': 0}
+        return {'domain': domain, 'converted': 0, 'skipped': 0, 'failed': 0}
 
     # Collect all PDF files in this domain folder
     pdf_files = []
@@ -212,26 +209,34 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
             pdf_files.append(pdf_file)
 
     if not pdf_files:
-        return {'domain': domain, 'converted': 0, 'skipped': 0}
+        return {'domain': domain, 'converted': 0, 'skipped': 0, 'failed': 0}
 
     # Prepare arguments for parallel processing
     file_args = [(f, domain_folder, output_path, filenames_to_remove) for f in pdf_files]
 
     converted = 0
     skipped = 0
+    failed = 0
 
     # Determine number of workers for files within this domain
     file_workers = max_workers if max_workers is not None else mp.cpu_count()
 
     # Process files in parallel using threads (I/O bound)
-    with ThreadPoolExecutor(max_workers=file_workers) as executor:
-        for status, count in executor.map(process_single_pdf_file, file_args):
-            if status == 'converted':
-                converted += count
-            else:
-                skipped += count
+    try:
+        with ThreadPoolExecutor(max_workers=file_workers) as executor:
+            for status, count in executor.map(process_single_pdf_file, file_args):
+                if status == 'converted':
+                    converted += count
+                elif status == 'skipped':
+                    skipped += count
+                else:  # 'failed'
+                    failed += count
+    except Exception as e:
+        print(f"Error in thread pool for domain {domain}: {e}")
+        # Mark remaining files as failed
+        failed += len(file_args) - (converted + skipped + failed)
 
-    return {'domain': domain, 'converted': converted, 'skipped': skipped}
+    return {'domain': domain, 'converted': converted, 'skipped': skipped, 'failed': failed}
 
 
 def convert_pdf_combined_to_markdown(
@@ -324,37 +329,49 @@ def convert_pdf_combined_to_markdown(
                 rel_path = subdir.relative_to(domain_folder)
                 (domain_output_dir / rel_path).mkdir(parents=True, exist_ok=True)
 
-    # Determine number of workers
-    if max_domain_workers is None:
-        max_domain_workers = min(mp.cpu_count(), len(domain_folders))
+    # Determine number of workers - use ThreadPoolExecutor only
+    if max_file_workers is None:
+        max_file_workers = min(16, mp.cpu_count())
 
-    # OPTIMIZATION 1 & 3: Process domains in parallel using ProcessPoolExecutor
-    process_func = partial(
-        process_domain_parallel,
-        input_path=input_path,
-        output_path=output_path,
-        allowed_domains=allowed_domains,
-        filenames_to_remove=filenames_to_remove,
-        max_workers=max_file_workers
-    )
+    print(f"Processing domains sequentially with {max_file_workers} file workers per domain")
+    print("  (Using ThreadPoolExecutor only to avoid process crashes)")
 
     results = []
-    with ProcessPoolExecutor(max_workers=max_domain_workers) as executor:
-        futures = [executor.submit(process_func, df) for df in domain_folders]
+    failed_domains = []
 
-        for future in tqdm(as_completed(futures), total=len(domain_folders),
-                          desc="Processing domains", unit="domain"):
-            results.append(future.result())
+    # Process domains sequentially to avoid ProcessPoolExecutor crashes
+    for domain_folder in tqdm(domain_folders, desc="Processing domains", unit="domain"):
+        domain_name = domain_folder.name
+        try:
+            result = process_domain_parallel(
+                domain_folder=domain_folder,
+                input_path=input_path,
+                output_path=output_path,
+                allowed_domains=allowed_domains,
+                filenames_to_remove=filenames_to_remove,
+                max_workers=max_file_workers
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"\nError processing domain {domain_name}: {e}")
+            failed_domains.append(domain_name)
+            results.append({'domain': domain_name, 'converted': 0, 'skipped': 0, 'failed': 0})
 
     # Aggregate results
-    domains_processed = {r['domain'] for r in results if r['converted'] > 0 or r['skipped'] > 0}
+    domains_processed = {r['domain'] for r in results if r['converted'] > 0 or r['skipped'] > 0 or r['failed'] > 0}
     files_converted = sum(r['converted'] for r in results)
     files_skipped = sum(r['skipped'] for r in results)
+    files_failed = sum(r['failed'] for r in results)
 
     print("\n" + "=" * 70)
     print(f"✓ Processed {len(domains_processed)} domains")
     print(f"✓ Converted {files_converted} files")
-    print(f"✓ Skipped {files_skipped} files")
+    print(f"✓ Skipped {files_skipped} files (intentional: empty PDFs, no text, filtered keywords)")
+    print(f"⚠ Failed {files_failed} files (PyMuPDF errors, corrupted PDFs)")
+    if failed_domains:
+        print(f"⚠ Failed {len(failed_domains)} entire domains: {', '.join(failed_domains[:5])}")
+        if len(failed_domains) > 5:
+            print(f"  ... and {len(failed_domains) - 5} more")
     print(f"✓ Output directory: {output_dir}")
     print("=" * 70)
 
@@ -362,6 +379,7 @@ def convert_pdf_combined_to_markdown(
         'domains_processed': len(domains_processed),
         'files_converted': files_converted,
         'files_skipped': files_skipped,
+        'files_failed': files_failed,
         'domains': sorted(list(domains_processed))
     }
 

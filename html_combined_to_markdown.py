@@ -107,6 +107,9 @@ def load_allowed_domains(excel_path):
 def convert_html_to_markdown(html_path, output_path, create_dirs=True):
     """
     Convert a single HTML file to markdown.
+
+    Returns:
+        str: 'converted' if successful, 'skipped' if intentionally skipped, 'failed' if error
     """
     try:
         # Read HTML file (handle both regular and gzipped)
@@ -122,29 +125,28 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
                     html_content = f.read()
 
         if not html_content:
-            return False
+            return 'skipped'  # Empty file - intentional skip
 
         # 1. AGGRESSIVE SANITIZATION
         # Ensure we have a string, ignoring invalid utf-8 sequences that might trip Rust
         if isinstance(html_content, bytes):
             html_content = html_content.decode('utf-8', errors='ignore')
         else:
-            # If it's already a string, encode and decode to strip "surrogates" 
+            # If it's already a string, encode and decode to strip "surrogates"
             # or other weird python-specific string artifacts
             html_content = html_content.encode('utf-8', errors='ignore').decode('utf-8')
 
         # 2. ROBUST CONVERSION WITH BASEEXCEPTION CATCHING
         try:
             markdown_text = convert_to_markdown(html_content)
-        except BaseException as e: 
+        except BaseException as e:
             # CRITICAL FIX: 'BaseException' catches pyo3_runtime.PanicException
             # 'Exception' does not always catch Rust panics
-            print(f"⚠ Rust panic on file {html_path.name}: {e}")
-            return False
+            return 'failed'  # Rust panic - conversion failure
 
         # Skip empty or redirect-only files
         if markdown_text in ("", "Redirecting"):
-            return False
+            return 'skipped'  # Empty/redirect - intentional skip
 
         # Create output directory if needed
         if create_dirs:
@@ -154,11 +156,10 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(markdown_text)
 
-        return True
+        return 'converted'  # Success
 
     except Exception as e:
-        print(f"General error on {html_path}: {e}")
-        return False
+        return 'failed'  # General error - conversion failure
 
 
 def process_single_html_file(args):
@@ -169,7 +170,7 @@ def process_single_html_file(args):
         args: Tuple of (html_file, domain_folder, output_path, filenames_to_remove)
 
     Returns:
-        tuple: (status, count) where status is 'converted' or 'skipped'
+        tuple: (status, count) where status is 'converted', 'skipped', or 'failed'
     """
     html_file, domain_folder, output_path, filenames_to_remove = args
 
@@ -190,10 +191,8 @@ def process_single_html_file(args):
     output_file_path = output_path / domain_folder.name / rel_path.parent / md_filename
 
     # Convert HTML to markdown (create subdirs on-demand to save memory)
-    if convert_html_to_markdown(html_file, output_file_path, create_dirs=True):
-        return ('converted', 1)
-    else:
-        return ('skipped', 1)
+    status = convert_html_to_markdown(html_file, output_file_path, create_dirs=True)
+    return (status, 1)
 
 
 def process_domain_parallel(domain_folder, input_path, output_path, allowed_domains, filenames_to_remove, max_workers=None):
@@ -227,13 +226,14 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
             html_files.append(html_file)
 
     if not html_files:
-        return {'domain': domain, 'converted': 0, 'skipped': 0}
+        return {'domain': domain, 'converted': 0, 'skipped': 0, 'failed': 0}
 
     # Prepare arguments for parallel processing
     file_args = [(f, domain_folder, output_path, filenames_to_remove) for f in html_files]
 
     converted = 0
     skipped = 0
+    failed = 0
 
     # Determine number of workers for files within this domain
     file_workers = max_workers if max_workers is not None else min(2, mp.cpu_count())
@@ -244,19 +244,21 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
             for status, count in executor.map(process_single_html_file, file_args):
                 if status == 'converted':
                     converted += count
-                else:
+                elif status == 'skipped':
                     skipped += count
+                else:  # 'failed'
+                    failed += count
     except Exception as e:
         print(f"Error in thread pool for domain {domain}: {e}")
-        # Mark remaining files as skipped
-        skipped += len(file_args) - (converted + skipped)
+        # Mark remaining files as failed
+        failed += len(file_args) - (converted + skipped + failed)
     finally:
         # Clean up memory after processing this domain
         del html_files
         del file_args
         gc.collect()
 
-    return {'domain': domain, 'converted': converted, 'skipped': skipped}
+    return {'domain': domain, 'converted': converted, 'skipped': skipped, 'failed': failed}
 
 
 def convert_html_combined_to_markdown(
@@ -389,19 +391,21 @@ def convert_html_combined_to_markdown(
             print(f"\nError processing domain {domain_name}: {e}")
             failed_domains.append(domain_name)
             # Add empty result to continue
-            results.append({'domain': domain_name, 'converted': 0, 'skipped': 0})
+            results.append({'domain': domain_name, 'converted': 0, 'skipped': 0, 'failed': 0})
 
     # Aggregate results
-    domains_processed = {r['domain'] for r in results if r['converted'] > 0 or r['skipped'] > 0}
+    domains_processed = {r['domain'] for r in results if r['converted'] > 0 or r['skipped'] > 0 or r['failed'] > 0}
     files_converted = sum(r['converted'] for r in results)
     files_skipped = sum(r['skipped'] for r in results)
+    files_failed = sum(r['failed'] for r in results)
 
     print("\n" + "=" * 70)
     print(f"✓ Processed {len(domains_processed)} domains")
     print(f"✓ Converted {files_converted} files")
-    print(f"✓ Skipped {files_skipped} files")
+    print(f"✓ Skipped {files_skipped} files (intentional: empty, redirects, filtered keywords)")
+    print(f"⚠ Failed {files_failed} files (Rust panics, encoding errors)")
     if failed_domains:
-        print(f"⚠ Failed {len(failed_domains)} domains: {', '.join(failed_domains[:5])}")
+        print(f"⚠ Failed {len(failed_domains)} entire domains: {', '.join(failed_domains[:5])}")
         if len(failed_domains) > 5:
             print(f"  ... and {len(failed_domains) - 5} more")
     print(f"✓ Output directory: {output_dir}")
@@ -411,6 +415,7 @@ def convert_html_combined_to_markdown(
         'domains_processed': len(domains_processed),
         'files_converted': files_converted,
         'files_skipped': files_skipped,
+        'files_failed': files_failed,
         'domains': sorted(list(domains_processed))
     }
 
