@@ -74,9 +74,9 @@ class RemoteEmbedding(BaseEmbedding):
                 )
 
             # Extract just the embedding vectors from the response
-            # The service returns [{"chunk_id": "...", "chunks": [...]}, ...]
-            # We need to extract just the "chunks" field which contains the embedding vectors
-            embeddings = [item["chunks"] for item in response_data]
+            # The service returns [{"chunk_id": "...", "chunk_embedding": [...]}, ...]
+            # We need to extract just the "chunk_embedding" field which contains the embedding vectors
+            embeddings = [item["chunk_embedding"] for item in response_data]
 
             return embeddings
 
@@ -113,9 +113,9 @@ class RemoteEmbedding(BaseEmbedding):
                 )
 
             # Extract just the embedding vectors from the response
-            # The service returns [{"chunk_id": "...", "chunks": [...]}, ...]
-            # We need to extract just the "chunks" field which contains the embedding vectors
-            embeddings = [item["chunks"] for item in response_data]
+            # The service returns [{"chunk_id": "...", "chunk_embedding": [...]}, ...]
+            # We need to extract just the "chunk_embedding" field which contains the embedding vectors
+            embeddings = [item["chunk_embedding"] for item in response_data]
 
             return embeddings
 
