@@ -153,7 +153,7 @@ def clean_elasticsearch_index(index_name, es_url="https://es.swissai.cscs.ch", u
         print(f"Warning: Error cleaning index: {e}")
 
 
-def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None):
+def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None, base_path=None):
     """
     Reads markdown files and returns list of LlamaIndex Documents.
     STRICTLY FILTERS: Any single line > 1000 characters is deleted.
@@ -163,6 +163,7 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
         domain_mappings (dict): Optional mapping of domain to original URL
         timestamps (dict): Optional mapping of file paths to retrieval timestamps
         force_domain (str): Optional domain to use instead of extracting from path (useful for subdirectories)
+        base_path (str): Optional base path to prepend to URLs (e.g., "staffnet/de" when indexing a subdirectory)
 
     Returns:
         list: List of Document objects with metadata
@@ -217,9 +218,26 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             url_preview = None
             if domain_mappings and domain in domain_mappings:
                 base_url = domain_mappings[domain]
-                if len(relative_path.parts) > 1:
+
+                # Determine page_path based on whether we're using force_domain
+                if force_domain:
+                    # When using force_domain, use the entire relative path
+                    # because the domain is not in the path structure
+                    page_path = str(relative_path).replace('.md', '.html')
+                    # If base_path is provided, prepend it
+                    if base_path:
+                        page_path = base_path.rstrip('/') + '/' + page_path
+                elif len(relative_path.parts) > 1:
+                    # Normal case: skip the first part (domain) and use the rest
                     page_path = '/'.join(relative_path.parts[1:])
                     page_path = page_path.replace('.md', '.html')
+                else:
+                    # Just the domain, no subpath
+                    url = base_url
+                    url_preview = base_url
+                    page_path = None
+
+                if page_path:
                     if not base_url.endswith('/'):
                         base_url += '/'
                     url = base_url + page_path
@@ -230,9 +248,6 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
                         url_preview = base_url.rstrip('/')
                     else:
                         url_preview = url
-                else:
-                    url = base_url
-                    url_preview = base_url
 
             retrieval_date_str = None
             if timestamps:
@@ -293,7 +308,8 @@ def index_markdown_to_elasticsearch(
     json_output_path=None,
     es_user="lsaie-1",
     es_password=None,
-    force_domain=None
+    force_domain=None,
+    base_path=None
 ):
     """
     Index markdown files to Elasticsearch with embeddings.
@@ -314,6 +330,7 @@ def index_markdown_to_elasticsearch(
         es_user (str): Elasticsearch username
         es_password (str, optional): Elasticsearch password
         force_domain (str, optional): Force a specific domain instead of extracting from path
+        base_path (str, optional): Base path to prepend to URLs (e.g., "staffnet/de")
 
     Returns:
         dict: Summary with 'documents_loaded', 'documents_indexed'
@@ -340,7 +357,7 @@ def index_markdown_to_elasticsearch(
 
     print("\nLoading documents...")
     sys.stdout.flush()
-    documents = get_documents_from_markdown_files(markdown_dir, domain_mappings, timestamps, force_domain)
+    documents = get_documents_from_markdown_files(markdown_dir, domain_mappings, timestamps, force_domain, base_path)
     print(f"Documents loaded: {len(documents)}")
     sys.stdout.flush()
 
