@@ -89,7 +89,7 @@ def load_timestamps(timestamps_path):
         return {}
 
 
-def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None):
+def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None):
     """
     Reads markdown files and returns list of LlamaIndex Documents with metadata.
 
@@ -97,6 +97,7 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
         markdown_dir (str): Directory containing markdown files organized by domain
         domain_mappings (dict): Optional mapping of domain to original URL
         timestamps (dict): Optional mapping of file paths to retrieval timestamps
+        force_domain (str): Optional domain to use instead of extracting from path (useful for subdirectories)
 
     Returns:
         list: List of Document objects with metadata
@@ -124,8 +125,11 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             # Get relative path from markdown_dir
             relative_path = md_file.relative_to(markdown_path)
 
-            # Extract domain (first directory in path)
-            domain = relative_path.parts[0] if relative_path.parts else "unknown"
+            # Extract domain (use force_domain if provided, otherwise first directory in path)
+            if force_domain:
+                domain = force_domain
+            else:
+                domain = relative_path.parts[0] if relative_path.parts else "unknown"
 
             # Get URL from mappings
             url = None
@@ -290,7 +294,8 @@ def index_markdown_to_elasticsearch(
     save_json=True,
     json_output_path=None,
     es_user="lsaie-1",
-    es_password=None
+    es_password=None,
+    force_domain=None
 ):
     """
     Index markdown files to Elasticsearch with embeddings.
@@ -309,6 +314,7 @@ def index_markdown_to_elasticsearch(
         json_output_path (str, optional): Path for JSON output file
         es_user (str): Elasticsearch username
         es_password (str, optional): Elasticsearch password
+        force_domain (str, optional): Force a specific domain instead of extracting from path
 
     Returns:
         dict: Summary with 'documents_loaded', 'documents_indexed', 'index_name'
@@ -348,7 +354,7 @@ def index_markdown_to_elasticsearch(
 
     # Load documents from markdown files
     print("\nLoading markdown documents...")
-    documents = get_documents_from_markdown_files(markdown_dir, domain_mappings, timestamps)
+    documents = get_documents_from_markdown_files(markdown_dir, domain_mappings, timestamps, force_domain)
 
     if not documents:
         print("No documents found!")
