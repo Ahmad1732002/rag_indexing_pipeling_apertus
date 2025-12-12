@@ -66,12 +66,17 @@ class RemoteEmbedding(BaseEmbedding):
                     f"Embedding service error {response.status_code}: {response.text}"
                 )
 
-            embeddings = response.json()
+            response_data = response.json()
 
-            if len(embeddings) != len(chunks):
+            if len(response_data) != len(chunks):
                 raise RuntimeError(
-                    f"Mismatch: received {len(embeddings)} embeddings for {len(chunks)} chunks"
+                    f"Mismatch: received {len(response_data)} embeddings for {len(chunks)} chunks"
                 )
+
+            # Extract just the embedding vectors from the response
+            # The service returns [{"chunk_id": "...", "chunks": [...]}, ...]
+            # We need to extract just the "chunks" field which contains the embedding vectors
+            embeddings = [item["chunks"] for item in response_data]
 
             return embeddings
 
@@ -100,12 +105,17 @@ class RemoteEmbedding(BaseEmbedding):
                     f"Embedding service error {response.status_code}: {response.text}"
                 )
 
-            embeddings = response.json()
+            response_data = response.json()
 
-            if len(embeddings) != len(chunks):
+            if len(response_data) != len(chunks):
                 raise RuntimeError(
-                    f"Mismatch: received {len(embeddings)} embeddings for {len(chunks)} chunks"
+                    f"Mismatch: received {len(response_data)} embeddings for {len(chunks)} chunks"
                 )
+
+            # Extract just the embedding vectors from the response
+            # The service returns [{"chunk_id": "...", "chunks": [...]}, ...]
+            # We need to extract just the "chunks" field which contains the embedding vectors
+            embeddings = [item["chunks"] for item in response_data]
 
             return embeddings
 
