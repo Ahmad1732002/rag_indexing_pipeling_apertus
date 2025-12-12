@@ -3,6 +3,7 @@
 Convert HTML files from html_combined directory to markdown files.
 Filters domains based on Excel sheet and maintains folder structure.
 Creates one markdown file per HTML page.
+Supports exclusion of specific domains and file keywords.
 """
 
 import os
@@ -12,22 +13,19 @@ from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
 from html_to_markdown import convert_to_markdown
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 import gc
 
+
+# ==========================================
+# Helper Functions
+# ==========================================
 
 def get_base_site_from_url(url_in):
     """
     Extracts the base site from the given URL.
     Example: "http://ethz.ch/about/test.png" returns "ethz.ch"
-
-    Args:
-        url_in (str): The url to find the base site for.
-
-    Returns:
-        str: Base Url
     """
     if "//" not in url_in:
         base_site = url_in
@@ -59,12 +57,6 @@ def get_base_url_from_url(url_in):
     """
     Extracts the base URL (protocol + domain) from a full URL.
     Example: "https://ethz.ch/de/about/test.html" returns "https://ethz.ch"
-
-    Args:
-        url_in (str): The full URL
-
-    Returns:
-        str: Base URL with protocol and domain only
     """
     if "//" not in url_in:
         return url_in
@@ -83,12 +75,6 @@ def get_base_url_from_url(url_in):
 def load_allowed_domains(excel_path):
     """
     Load allowed domains from Excel file.
-
-    Args:
-        excel_path (str): Path to Excel file with URL column
-
-    Returns:
-        set: Set of allowed base domains
     """
     df = pd.read_excel(excel_path)
     df = df.fillna("")
@@ -107,9 +93,7 @@ def load_allowed_domains(excel_path):
 def convert_html_to_markdown(html_path, output_path, create_dirs=True):
     """
     Convert a single HTML file to markdown.
-
-    Returns:
-        str: 'converted' if successful, 'skipped' if intentionally skipped, 'failed' if error
+    Returns: 'converted', 'skipped', or 'failed'
     """
     try:
         # Read HTML file (handle both regular and gzipped)
@@ -125,28 +109,24 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
                     html_content = f.read()
 
         if not html_content:
-            return 'skipped'  # Empty file - intentional skip
+            return 'skipped'
 
         # 1. AGGRESSIVE SANITIZATION
-        # Ensure we have a string, ignoring invalid utf-8 sequences that might trip Rust
         if isinstance(html_content, bytes):
             html_content = html_content.decode('utf-8', errors='ignore')
         else:
-            # If it's already a string, encode and decode to strip "surrogates"
-            # or other weird python-specific string artifacts
             html_content = html_content.encode('utf-8', errors='ignore').decode('utf-8')
 
-        # 2. ROBUST CONVERSION WITH BASEEXCEPTION CATCHING
+        # 2. ROBUST CONVERSION
         try:
             markdown_text = convert_to_markdown(html_content)
-        except BaseException as e:
-            # CRITICAL FIX: 'BaseException' catches pyo3_runtime.PanicException
-            # 'Exception' does not always catch Rust panics
-            return 'failed'  # Rust panic - conversion failure
+        except BaseException:
+            # Catches pyo3_runtime.PanicException from Rust
+            return 'failed'
 
         # Skip empty or redirect-only files
         if markdown_text in ("", "Redirecting"):
-            return 'skipped'  # Empty/redirect - intentional skip
+            return 'skipped'
 
         # Create output directory if needed
         if create_dirs:
@@ -156,28 +136,30 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(markdown_text)
 
-        return 'converted'  # Success
+        return 'converted'
 
-    except Exception as e:
-        return 'failed'  # General error - conversion failure
+    except Exception:
+        return 'failed'
 
+
+# ==========================================
+# Core Processing Functions
+# ==========================================
 
 def process_single_html_file(args):
     """
     Process a single HTML file (for parallel execution).
-
-    Args:
-        args: Tuple of (html_file, domain_folder, output_path, filenames_to_remove)
-
-    Returns:
-        tuple: (status, count) where status is 'converted', 'skipped', or 'failed'
+    Args: (html_file, domain_folder, output_path, exclude_files)
     """
-    html_file, domain_folder, output_path, filenames_to_remove = args
+    html_file, domain_folder, output_path, exclude_files = args
 
-    # Check if filename should be skipped
-    for keyword in filenames_to_remove:
-        if keyword in html_file.name.lower():
-            return ('skipped', 1)
+    # Check if filename should be skipped based on keywords
+    # This filters specific files like 'impressum.html'
+    if exclude_files:
+        filename_lower = html_file.name.lower()
+        for keyword in exclude_files:
+            if keyword in filename_lower:
+                return ('skipped', 1)
 
     # Calculate relative path from domain folder
     rel_path = html_file.relative_to(domain_folder)
@@ -190,25 +172,14 @@ def process_single_html_file(args):
 
     output_file_path = output_path / domain_folder.name / rel_path.parent / md_filename
 
-    # Convert HTML to markdown (create subdirs on-demand to save memory)
+    # Convert HTML to markdown
     status = convert_html_to_markdown(html_file, output_file_path, create_dirs=True)
     return (status, 1)
 
 
-def process_domain_parallel(domain_folder, input_path, output_path, allowed_domains, filenames_to_remove, max_workers=None):
+def process_domain_parallel(domain_folder, input_path, output_path, allowed_domains, exclude_files, max_workers=None):
     """
     Process all HTML files in a domain folder in parallel.
-
-    Args:
-        domain_folder (Path): Domain folder to process
-        input_path (Path): Input base path
-        output_path (Path): Output base path
-        allowed_domains (set): Set of allowed domains (or None)
-        filenames_to_remove (list): Keywords to skip
-        max_workers (int, optional): Number of thread workers for file I/O. If None, uses CPU count.
-
-    Returns:
-        dict: Results with 'domain', 'converted', 'skipped' counts
     """
     domain = domain_folder.name
 
@@ -221,7 +192,6 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
     for html_file in domain_folder.rglob('*'):
         if not html_file.is_file():
             continue
-        # Check if it's an HTML file
         if html_file.suffix in ['.html', '.htm'] or str(html_file).endswith('.html.gz'):
             html_files.append(html_file)
 
@@ -229,16 +199,15 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
         return {'domain': domain, 'converted': 0, 'skipped': 0, 'failed': 0}
 
     # Prepare arguments for parallel processing
-    file_args = [(f, domain_folder, output_path, filenames_to_remove) for f in html_files]
+    # Pass exclude_files down to the worker
+    file_args = [(f, domain_folder, output_path, exclude_files) for f in html_files]
 
     converted = 0
     skipped = 0
     failed = 0
 
-    # Determine number of workers for files within this domain
     file_workers = max_workers if max_workers is not None else min(2, mp.cpu_count())
 
-    # Process files in parallel using threads (I/O bound)
     try:
         with ThreadPoolExecutor(max_workers=file_workers) as executor:
             for status, count in executor.map(process_single_html_file, file_args):
@@ -250,10 +219,8 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
                     failed += count
     except Exception as e:
         print(f"Error in thread pool for domain {domain}: {e}")
-        # Mark remaining files as failed
         failed += len(file_args) - (converted + skipped + failed)
     finally:
-        # Clean up memory after processing this domain
         del html_files
         del file_args
         gc.collect()
@@ -266,39 +233,24 @@ def convert_html_combined_to_markdown(
     output_dir,
     excel_path=None,
     mappings_path=None,
-    filenames_to_remove=[
-        "impressum", "datenschutz", "kontakt", "robots",
-        "imprint", "data-protection", "contact", "copyright",
-    ],
-    max_domain_workers=None,  # Deprecated - kept for compatibility
+    exclude_domains=None,     # NEW: List of exact domain names to skip
+    exclude_files=None,       # NEW: List of keywords to skip files
     max_file_workers=None
 ):
     """
     Convert HTML files from html_combined directory to markdown files.
-    Creates one markdown file per HTML page, maintaining folder structure.
-    Uses ThreadPoolExecutor for file-level parallelism (domains processed sequentially).
-
-    Args:
-        input_dir (str): Path to html_combined directory
-        output_dir (str): Path where markdown files should be saved
-        excel_path (str, optional): Path to Excel file with URL column to filter domains.
-            If None, processes all domains.
-        mappings_path (str, optional): Path to save domain->URL mappings JSON file
-        filenames_to_remove (list): Keywords that if found in filename, file is skipped
-        max_domain_workers (int, optional): DEPRECATED - Kept for compatibility, not used.
-        max_file_workers (int, optional): Max parallel files per domain. If None, uses min(16, CPU count).
-
-    Returns:
-        dict: Summary with 'domains_processed', 'files_converted', 'files_skipped'
     """
     print("=" * 70)
     print("HTML to Markdown Converter (Parallelized)")
     print("=" * 70)
     print(f"Input:  {input_dir}")
     print(f"Output: {output_dir}")
-    if excel_path:
-        print(f"Excel:  {excel_path}")
-    print("=" * 70)
+    
+    # Initialize exclusions if None
+    if exclude_domains is None:
+        exclude_domains = []
+    if exclude_files is None:
+        exclude_files = []
 
     # Load allowed domains from Excel if provided
     allowed_domains = None
@@ -316,65 +268,65 @@ def convert_html_combined_to_markdown(
             if url != "":
                 base_site = get_base_site_from_url(url)
                 if base_site not in domain_mappings:
-                    # Store only the base URL (protocol + domain), not the full path
                     domain_mappings[base_site] = get_base_url_from_url(url)
 
-        # Save mappings
         mappings_path_obj = Path(mappings_path)
         mappings_path_obj.parent.mkdir(parents=True, exist_ok=True)
         with open(mappings_path, 'w', encoding='utf-8') as f:
             json.dump(domain_mappings, f, indent=2)
         print(f"Saved domain mappings to {mappings_path}")
-
-        # Clear large DataFrame from memory
+        
         del df
         del urls
-        gc.collect()  # Force garbage collection
+        gc.collect()
 
     # Process files
     input_path = Path(input_dir)
     output_path = Path(output_dir)
 
-    # Walk through all domain folders in html_combined
-    domain_folders = [d for d in input_path.iterdir() if d.is_dir()]
+    # Get all potential folders
+    all_domain_folders = [d for d in input_path.iterdir() if d.is_dir()]
+    
+    # Filter domains based on exclusion list and allowed list
+    domain_folders = []
+    skipped_count = 0
+    
+    for d in all_domain_folders:
+        # 1. Check Explicit Exclusion (The crashing domains)
+        if d.name in exclude_domains:
+            print(f"⚠ Skipping excluded domain: {d.name}")
+            skipped_count += 1
+            continue
+            
+        # 2. Check Allowed List (Excel filtering)
+        if allowed_domains is not None and d.name not in allowed_domains:
+            continue
+            
+        domain_folders.append(d)
 
-    # --- 🚨 QUICK FIX: Filter out crashing domain ---
-    domain_folders = [d for d in domain_folders if d.name != "polyphys.mat.ethz.ch"]
-    print("⚠ Explicitly skipping crashing domain: polyphys.mat.ethz.ch")
-
-    # Filter domains if allowed_domains is provided
-    if allowed_domains is not None:
-        domain_folders = [d for d in domain_folders if d.name in allowed_domains]
-
-    print(f"\nProcessing {len(domain_folders)} domain folders in parallel...")
+    print(f"\nProcessing {len(domain_folders)} domain folders (Skipped {skipped_count} explicitly)...")
     print("=" * 70)
 
-    # OPTIMIZATION 4: Batch directory creation - Only top-level
-    # Pre-create only top-level output directories (subdirs created during processing)
+    # Pre-create output directories
     print("Pre-creating output directories...")
     for domain_folder in domain_folders:
         domain_output_dir = output_path / domain_folder.name
         domain_output_dir.mkdir(parents=True, exist_ok=True)
-        # Subdirectories will be created on-demand during file writing
 
-    # Determine number of workers
-    # Use ThreadPoolExecutor only (no ProcessPoolExecutor) to avoid worker crashes
     if max_file_workers is None:
-        max_file_workers = min(16, mp.cpu_count())  # Use more threads since no process overhead
+        max_file_workers = min(16, mp.cpu_count())
 
     print(f"Processing domains sequentially with {max_file_workers} file workers per domain")
-    print("  (Using ThreadPoolExecutor only to avoid process crashes)")
 
-    # Clear allowed_domains and domain_mappings from memory
+    # Clear memory
     del allowed_domains
     if 'domain_mappings' in locals():
         del domain_mappings
-    gc.collect()  # Force garbage collection
+    gc.collect()
 
     results = []
     failed_domains = []
 
-    # Process domains sequentially to avoid ProcessPoolExecutor crashes
     for domain_folder in tqdm(domain_folders, desc="Processing domains", unit="domain"):
         domain_name = domain_folder.name
         try:
@@ -382,15 +334,14 @@ def convert_html_combined_to_markdown(
                 domain_folder=domain_folder,
                 input_path=input_path,
                 output_path=output_path,
-                allowed_domains=None,
-                filenames_to_remove=filenames_to_remove,
+                allowed_domains=None, # Already filtered above
+                exclude_files=exclude_files, # Pass the file exclusion list
                 max_workers=max_file_workers
             )
             results.append(result)
         except Exception as e:
             print(f"\nError processing domain {domain_name}: {e}")
             failed_domains.append(domain_name)
-            # Add empty result to continue
             results.append({'domain': domain_name, 'converted': 0, 'skipped': 0, 'failed': 0})
 
     # Aggregate results
@@ -402,38 +353,71 @@ def convert_html_combined_to_markdown(
     print("\n" + "=" * 70)
     print(f"✓ Processed {len(domains_processed)} domains")
     print(f"✓ Converted {files_converted} files")
-    print(f"✓ Skipped {files_skipped} files (intentional: empty, redirects, filtered keywords)")
-    print(f"⚠ Failed {files_failed} files (Rust panics, encoding errors)")
-    if failed_domains:
-        print(f"⚠ Failed {len(failed_domains)} entire domains: {', '.join(failed_domains[:5])}")
-        if len(failed_domains) > 5:
-            print(f"  ... and {len(failed_domains) - 5} more")
-    print(f"✓ Output directory: {output_dir}")
+    print(f"✓ Skipped {files_skipped} files")
+    print(f"⚠ Failed {files_failed} files")
     print("=" * 70)
 
     return {
         'domains_processed': len(domains_processed),
         'files_converted': files_converted,
         'files_skipped': files_skipped,
-        'files_failed': files_failed,
-        'domains': sorted(list(domains_processed))
+        'files_failed': files_failed
     }
 
 
-def main():
-    """Main function with default paths."""
-    input_dir = "output/html_combined"
-    output_dir = "output/markdown"
-    excel_path = "data/2025-11-20_19945_topics.xlsx"
-    mappings_path = "output/domain_mappings.json"
+# ==========================================
+# Main Execution
+# ==========================================
 
+def process_html_pipeline():
+    """
+    Main entry point for the HTML pipeline.
+    Configures paths and exclusion lists.
+    """
+    
+    # 1. Configuration Paths
+    html_raw_dir = "output/html_raw"        # Adjust if needed
+    html_combined_dir = "output/html_combined"
+    markdown_output_dir = "output/markdown"
+    topics_excel_path = "data/2025-11-20_19945_topics.xlsx"
+    html_mappings_path = "output/domain_mappings.json"
+    timestamps_json_path = "output/timestamps.json"
+
+    # 2. Define Exclusions
+    # Files to skip (substring match in filename)
+    files_to_exclude = [
+        "impressum", "datenschutz", "kontakt", "robots",
+        "imprint", "data-protection", "contact", "copyright",
+        "login", "search", "suche"
+    ]
+
+    # Domains to skip (exact match of folder name)
+    domains_to_exclude = [
+        "polyphys.mat.ethz.ch", # Known crasher
+        "broken-site.ethz.ch"
+    ]
+
+    # 3. Pipeline Steps
+    
+    # Step A: Combine Domains (Commented out as requested)
+    # combine_domains_by_timestamp(
+    #     input_dir=html_raw_dir,
+    #     output_dir=html_combined_dir,
+    #     timestamps_json_path=timestamps_json_path,
+    #     excel_path=topics_excel_path
+    # )
+
+    # Step B: Convert to Markdown
+    print("Starting HTML conversion pipeline...")
     convert_html_combined_to_markdown(
-        input_dir,
-        output_dir,
-        excel_path=excel_path,
-        mappings_path=mappings_path
+        input_dir=html_combined_dir,
+        output_dir=markdown_output_dir,
+        excel_path=topics_excel_path,
+        mappings_path=html_mappings_path,
+        exclude_domains=domains_to_exclude,
+        exclude_files=files_to_exclude
     )
 
-
 if __name__ == "__main__":
-    main()
+    print("Doing html pipeline")
+    process_html_pipeline()
