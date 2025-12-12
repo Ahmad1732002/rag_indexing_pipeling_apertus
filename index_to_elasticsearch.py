@@ -13,8 +13,8 @@ from tqdm import tqdm
 from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.ingestion import IngestionPipeline
-from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.vector_stores.elasticsearch import ElasticsearchStore
+from remote_embedding import RemoteEmbedding
 import os
 import warnings
 
@@ -385,25 +385,29 @@ def index_markdown_to_elasticsearch(
             es_password=es_password
         )
 
-    # Create embedding model with extended timeout
-    print("\nInitializing Ollama embedding model...")
+    # Create remote embedding model
+    print("\nInitializing remote embedding service...")
+
+    # Get embedding service URL from environment
+    embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
+    if not embedding_service_url:
+        raise ValueError("EMBEDDING_SERVICE_URL not set in environment variables")
+
     try:
-        ollama_embedding = OllamaEmbedding(
-            model_name=embedding_model,
-            base_url="http://127.0.0.1:11434",
-            request_timeout=300.0  # Increase timeout to 300 seconds (5 minutes)
+        remote_embedding = RemoteEmbedding(
+            service_url=embedding_service_url,
+            timeout=300.0  # 5 minutes timeout
         )
-        print(f"✓ Connected to Ollama with model: {embedding_model}")
+        print(f"✓ Connected to remote embedding service: {embedding_service_url}")
     except Exception as e:
-        print(f"✗ Error connecting to Ollama: {e}")
-        print("Make sure Ollama is running: ollama serve")
+        print(f"✗ Error connecting to remote embedding service: {e}")
         raise
 
     # Create ingestion pipeline
     pipeline = IngestionPipeline(
         transformations=[
             SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap),
-            ollama_embedding,
+            remote_embedding,
         ],
         vector_store=es_vector_store
     )
