@@ -366,13 +366,6 @@ def index_markdown_to_elasticsearch(
         sys.stdout.flush()
         return {'documents_loaded': 0, 'documents_indexed': 0}
 
-    # 🔴 TEMPORARY HARDCODED FIX - REMOVE LATER!
-    print(f"⚠️ TAKING LAST 400 AND REVERSING")
-    documents = list(reversed(documents[-400:]))
-    print(f"Processing {len(documents)} documents")
-    sys.stdout.flush()
-    # 🔴 END TEMPORARY FIX
-
     # --- DEBUG JSON SAVE ---
     if save_json:
         if json_output_path is None:
