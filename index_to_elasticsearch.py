@@ -366,22 +366,6 @@ def index_markdown_to_elasticsearch(
         sys.stdout.flush()
         return {'documents_loaded': 0, 'documents_indexed': 0}
 
-    # 🔴 TEMPORARY QUICKFIX: Skip already processed docs and reverse order
-    # REMOVE THIS LATER!
-    SKIP_FIRST_N = 33263  # Already indexed
-    REVERSE_ORDER = True  # Process from end
-
-    if SKIP_FIRST_N > 0:
-        print(f"⚠️ QUICKFIX: Skipping first {SKIP_FIRST_N} documents")
-        documents = documents[SKIP_FIRST_N:]
-        print(f"Remaining documents: {len(documents)}")
-
-    if REVERSE_ORDER:
-        print(f"⚠️ QUICKFIX: Reversing document order")
-        documents = list(reversed(documents))
-
-    sys.stdout.flush()
-
     # --- DEBUG JSON SAVE ---
     if save_json:
         if json_output_path is None:
@@ -475,8 +459,8 @@ def index_markdown_to_elasticsearch(
                     valid_nodes.append(node)
 
                 except Exception as e_embed:
-                    print("Embedding failed")
-                    print(f"error: {e}")
+                    print(f"\nEmbedding failed for chunk {node_idx} in doc {i}")
+                    print(f"error: {e_embed}")
                     # If embedding fails for one chunk, just skip that chunk
                     continue
 
@@ -497,10 +481,9 @@ def index_markdown_to_elasticsearch(
                 try:
                     es_vector_store.add(sub_batch)
                 except Exception as e_upload:
-                    print(f"\n⚠️ Upload failed for slice {u_idx} in batch {i}: {e_upload}")
+                    print(f"\n⚠️ Upload failed for slice {u_idx} in batch {i}")
+                    print(f"error: {e_upload}")
                     sys.stdout.flush()
-                    print("Upload failed")
-                    print(f"error: {e}")
                     continue  # Try the next slice
 
             total_processed += len(batch)
@@ -510,8 +493,6 @@ def index_markdown_to_elasticsearch(
             print(f"Error: {e}")
             sys.stdout.flush()
             total_skipped += len(batch)
-            print("crash in file")
-            print(f"error: {e}")
             continue
 
     print("\n" + "=" * 70)
