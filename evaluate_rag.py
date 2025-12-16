@@ -170,7 +170,8 @@ def evaluate_question(question, relevant_docs, es_config, top_k=100):
         'missing_docs': [],
         'success': False,
         'rank_of_first_match': None,
-        'all_ranks': []
+        'all_ranks': [],
+        'search_results': []  # Store results for reuse
     }
 
     try:
@@ -185,6 +186,7 @@ def evaluate_question(question, relevant_docs, es_config, top_k=100):
         )
 
         result['retrieved_count'] = len(search_results)
+        result['search_results'] = search_results  # Store for reuse
 
         # Check each relevant doc
         for relevant_url in relevant_docs:
@@ -340,30 +342,20 @@ def main():
         for doc_url in relevant_docs:
             print(f"  Looking for: {doc_url}")
 
-        # Print URLs found in search results
+        # Print URLs found in search results (reuse stored results)
         if result.get('retrieved_count', 0) > 0:
-            try:
-                search_results = simple_search(
-                    query=question,
-                    index_name=es_config['index_name'],
-                    es_url=es_config['es_url'],
-                    top_k=min(10, args.top_k),
-                    es_user=es_config['es_user'],
-                    es_password=es_config['es_password']
-                )
-                found_urls = []
-                for sr in search_results:
-                    url = sr.get('url_preview') or sr.get('url')
-                    if url:
-                        found_urls.append(url)
-                if found_urls:
-                    print(f"  Found URLs:")
-                    for url in found_urls[:5]:  # Show first 5
-                        print(f"    - {url}")
-                else:
-                    print(f"  Found URLs: (none)")
-            except Exception as e:
-                print(f"  Found URLs: (error: {e})")
+            search_results = result.get('search_results', [])
+            found_urls = []
+            for sr in search_results[:10]:  # Show first 10
+                url = sr.get('url_preview') or sr.get('url')
+                if url:
+                    found_urls.append(url)
+            if found_urls:
+                print(f"  Found URLs (top {len(found_urls[:5])}):")
+                for url in found_urls[:5]:  # Show first 5
+                    print(f"    - {url}")
+            else:
+                print(f"  Found URLs: (none)")
         else:
             print(f"  Found URLs: (no results)")
 
