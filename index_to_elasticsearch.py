@@ -13,46 +13,234 @@ Direct usage:
         indexed_files_path="/path/to/indexed_files.json",  # Optional
         ...
     )
-
-Via pipeline script:
-    python run_indexing_pipeline.py \\
-        --warc-input-dir ./data/warcs \\
-        --topics-excel-path ./topics.xlsx \\
-        --indexed-files-path /path/to/indexed_files.json  # Optional
-
-Via SLURM:
-    sbatch index.sbatch <warc_dir> <excel_path> [indexed_files_path]
-
-The tracking file stores relative paths of successfully indexed markdown files.
-On subsequent runs, files in the tracking list will be skipped with an 'already_indexed' counter.
 """
 
 import json
-import requests
 import re
 import sys
+import os
+import time
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# --- LlamaIndex Imports ---
 from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.ingestion import IngestionPipeline, run_transformations
 from llama_index.vector_stores.elasticsearch import ElasticsearchStore
-from remote_embedding import RemoteEmbedding
-import os
-import warnings
+
+# --- Local Import (Your Backend Wrapper) ---
+try:
+    from remote_embedding import RemoteEmbedding
+except ImportError:
+    print("❌ Critical Error: Could not import 'RemoteEmbedding'.")
+    print("Ensure remote_embedding.py is in the same directory.")
+    sys.exit(1)
+
+
+# --- CONFIGURATION ---
+CHUNK_SIZE = 512
+OVERLAP = 64
+MAX_CHAR_LIMIT = 5000  # <--- FIXED: Was 64 (too small), set to 5000 for safety.
+
+# --- HELPER FUNCTIONS (Must be global for multiprocessing) ---
+
+def get_slurm_cores():
+    """Robustly detect available cores in a SLURM allocation."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 32
+
+def clean_garbage_text(text):
+    """Aggressive cleaning for PDF artifacts."""
+    # Remove long strings of non-whitespace characters (base64 garbage)
+    text = re.sub(r'\S{100,}', '', text)
+    # Remove excessive repeated characters (e.g. "__________")
+    text = re.sub(r'(.)\1{10,}', r'\1\1\1', text)
+    return text
+
+def adaptive_get_embeddings(remote_embedding_client, texts):
+    """
+    Robust embedding fetcher. 
+    Recursively splits batches if the backend returns a 400/Context Error.
+    """
+    if not texts:
+        return []
+
+    try:
+        # Optimistic: Try the whole batch
+        return remote_embedding_client._get_text_embeddings(texts)
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        # Check for context length error (400) or similar
+        if "400" in error_msg or "length" in error_msg or "large" in error_msg:
+            
+            # BASE CASE: A single text is failing
+            if len(texts) == 1:
+                text = texts[0]
+                if len(text) > MAX_CHAR_LIMIT:
+                    # Truncate and retry
+                    truncated = text[:MAX_CHAR_LIMIT]
+                    return adaptive_get_embeddings(remote_embedding_client, [truncated])
+                else:
+                    # Text is small but still failing? Skip it.
+                    raise ValueError(f"Chunk failed permanently: {error_msg}")
+
+            # RECURSIVE CASE: Split batch in half
+            mid = len(texts) // 2
+            left_texts = texts[:mid]
+            right_texts = texts[mid:]
+            
+            return (adaptive_get_embeddings(remote_embedding_client, left_texts) + 
+                    adaptive_get_embeddings(remote_embedding_client, right_texts))
+        
+        raise e
+
+def worker_process_batch(task_payload):
+    """
+    The Worker Function (runs in separate process).
+    Handles: Load -> Clean -> Metadata/URL Gen -> Split -> Embed.
+    """
+    (file_paths, base_dir, domain_mappings, timestamps, 
+     force_domain, base_path) = task_payload
+
+    embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
+    if not embedding_service_url:
+        return [] 
+    
+    # Each process creates its OWN connection pool
+    remote_embed = RemoteEmbedding(service_url=embedding_service_url, timeout=300.0)
+    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=OVERLAP)
+    
+    processed_nodes = [] 
+
+    for f_path_str in file_paths:
+        try:
+            f_path = Path(f_path_str)
+            base_path_obj = Path(base_dir)
+            
+            # --- Load & Clean ---
+            try:
+                relative_path = f_path.relative_to(base_path_obj)
+            except ValueError:
+                continue 
+
+            relative_path_str = str(relative_path)
+
+            # Domain & Tracking Key
+            if force_domain:
+                domain = force_domain
+                tracking_key = f"{domain}/{relative_path_str}"
+            else:
+                domain = relative_path.parts[0] if relative_path.parts else "unknown"
+                tracking_key = relative_path_str
+
+            with open(f_path, 'r', encoding='utf-8') as f:
+                raw = f.read()
+
+            # Fast line filtering
+            lines = [L for L in raw.split('\n') if len(L) <= 1000]
+            content = '\n'.join(lines)
+            content = clean_garbage_text(content)
+            
+            if not content.strip():
+                continue
+
+            # --- Metadata & URL Logic (CRITICAL RESTORATION) ---
+            url = None
+            url_preview = None
+            
+            if domain_mappings and domain in domain_mappings:
+                base_url = domain_mappings[domain]
+                
+                # Determine page path
+                if force_domain:
+                    page_path = str(relative_path).replace('.md', '.html')
+                    if base_path:
+                        page_path = base_path.rstrip('/') + '/' + page_path
+                elif len(relative_path.parts) > 1:
+                    page_path = '/'.join(relative_path.parts[1:])
+                    page_path = page_path.replace('.md', '.html')
+                else:
+                    url = base_url
+                    url_preview = base_url
+                    page_path = None
+
+                # Construct full URL
+                if page_path:
+                    if not base_url.endswith('/'):
+                        base_url += '/'
+                    url = base_url + page_path
+                    
+                    if page_path.endswith('/index.html'):
+                        clean_path = page_path[:-11]
+                        url_preview = base_url + clean_path if clean_path else base_url.rstrip('/')
+                    elif page_path == 'index.html':
+                        url_preview = base_url.rstrip('/')
+                    else:
+                        url_preview = url
+
+            # Timestamp Logic
+            retrieval_date = None
+            if timestamps:
+                html_key = str(relative_path).replace('.md', '.html')
+                retrieval_date = timestamps.get(html_key)
+
+            # Title extraction
+            title = f_path.stem
+            
+            # Metadata Dict
+            metadata = {
+                "file_path": tracking_key,
+                "file_name": f_path.name,
+                "domain": domain,
+                "title": title,
+                "source": "ethz-webarchive"
+            }
+            if url: metadata["url"] = url
+            if url_preview: metadata["url_preview"] = url_preview
+            if retrieval_date: metadata["retrieval_date"] = retrieval_date
+
+            doc = Document(text=content, metadata=metadata)
+
+            # --- Split ---
+            nodes = splitter.get_nodes_from_documents([doc])
+            if not nodes:
+                continue
+
+            # --- Embed (Network IO) ---
+            node_texts = [n.get_content() for n in nodes]
+            
+            try:
+                embeddings = adaptive_get_embeddings(remote_embed, node_texts)
+                
+                if len(embeddings) != len(nodes):
+                    continue 
+
+                valid_nodes = []
+                for node, emb in zip(nodes, embeddings):
+                    node.embedding = emb
+                    valid_nodes.append(node)
+                
+                processed_nodes.extend(valid_nodes)
+
+            except Exception:
+                continue
+
+        except Exception:
+            continue
+
+    return processed_nodes
 
 
 def extract_timestamp_from_path(file_path):
     """
     Extract timestamp from file path if it contains WARC filename pattern.
     Returns datetime object or None.
-
-    Pattern: YYYYMMDDHHMMSS in WARC filename
-    Example: ARCHIVEIT-19945-TEST-JOB2538000-0-SEED4432727-20250409125201867-00000-9618ziof.warc.gz
-
-    Note: After combining domains, timestamps are lost. This will return None.
-    To preserve timestamps, you need to store them during the combine step.
     """
     # Look for pattern: 14 digits in the path
     match = re.search(r'-(\d{14})\d*-', str(file_path))
@@ -66,15 +254,7 @@ def extract_timestamp_from_path(file_path):
 
 
 def load_domain_mappings(mappings_path):
-    """
-    Load domain to URL mappings from JSON file.
-
-    Args:
-        mappings_path (str): Path to domain mappings JSON file
-
-    Returns:
-        dict: Domain to URL mapping
-    """
+    """Load domain to URL mappings from JSON file."""
     if not mappings_path or not Path(mappings_path).exists():
         print(f"Warning: Mappings file not found at {mappings_path}")
         return {}
@@ -90,15 +270,7 @@ def load_domain_mappings(mappings_path):
 
 
 def load_timestamps(timestamps_path):
-    """
-    Load file retrieval timestamps from JSON file.
-
-    Args:
-        timestamps_path (str): Path to timestamps JSON file
-
-    Returns:
-        dict: File path to timestamp mapping
-    """
+    """Load file retrieval timestamps from JSON file."""
     if not timestamps_path or not Path(timestamps_path).exists():
         print(f"Warning: Timestamps file not found at {timestamps_path}")
         return {}
@@ -114,15 +286,7 @@ def load_timestamps(timestamps_path):
 
 
 def load_indexed_files(indexed_files_path):
-    """
-    Load set of already indexed file paths from JSON file.
-
-    Args:
-        indexed_files_path (str): Path to indexed files tracking JSON file
-
-    Returns:
-        set: Set of file paths that have been successfully indexed
-    """
+    """Load set of already indexed file paths from JSON file."""
     if not indexed_files_path or not Path(indexed_files_path).exists():
         print(f"No indexed files tracking found at {indexed_files_path} (starting fresh)")
         return set()
@@ -139,13 +303,7 @@ def load_indexed_files(indexed_files_path):
 
 
 def save_indexed_files(indexed_files_set, indexed_files_path):
-    """
-    Save set of successfully indexed file paths to JSON file.
-
-    Args:
-        indexed_files_set (set): Set of file paths that have been successfully indexed
-        indexed_files_path (str): Path to save indexed files tracking JSON file
-    """
+    """Save set of successfully indexed file paths to JSON file."""
     try:
         indexed_list = sorted(list(indexed_files_set))
         output_path = Path(indexed_files_path)
@@ -160,13 +318,7 @@ def save_indexed_files(indexed_files_set, indexed_files_path):
 
 
 def save_documents_to_json(documents, output_file="indexed_documents.json"):
-    """
-    Save documents to JSON file for inspection/backup.
-
-    Args:
-        documents (list): List of Document objects
-        output_file (str): Path to output JSON file
-    """
+    """Save documents to JSON file for inspection/backup."""
     json_docs = []
 
     for idx, doc in enumerate(documents):
@@ -193,16 +345,7 @@ def save_documents_to_json(documents, output_file="indexed_documents.json"):
 
 
 def clean_elasticsearch_index(index_name, es_url="https://es.swissai.cscs.ch", username="lsaie-1", password=None):
-    """
-    Delete existing Elasticsearch index to ensure clean state.
-
-    Args:
-        index_name (str): Name of the index to delete
-        es_url (str): Elasticsearch URL
-        username (str): Elasticsearch username
-        password (str, optional): Elasticsearch password
-    """
-    # Only require authentication for remote servers (not localhost)
+    """Delete existing Elasticsearch index to ensure clean state."""
     auth = None
     if "127.0.0.1" not in es_url and "localhost" not in es_url:
         if not password:
@@ -225,18 +368,7 @@ def clean_elasticsearch_index(index_name, es_url="https://es.swissai.cscs.ch", u
 def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None, base_path=None, indexed_files=None):
     """
     Reads markdown files and returns list of LlamaIndex Documents.
-    STRICTLY FILTERS: Any single line > 1000 characters is deleted.
-
-    Args:
-        markdown_dir (str): Directory containing markdown files organized by domain
-        domain_mappings (dict): Optional mapping of domain to original URL
-        timestamps (dict): Optional mapping of file paths to retrieval timestamps
-        force_domain (str): Optional domain to use instead of extracting from path (useful for subdirectories)
-        base_path (str): Optional base path to prepend to URLs (e.g., "staffnet/de" when indexing a subdirectory)
-        indexed_files (set): Optional set of already indexed file paths to skip
-
-    Returns:
-        tuple: (List of Document objects with metadata, already_indexed_count)
+    Includes filtering for massive lines and garbage text.
     """
     documents = []
     markdown_path = Path(markdown_dir)
@@ -248,7 +380,6 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
     md_files = list(markdown_path.rglob("*.md"))
     print(f"Found {len(md_files)} markdown files")
 
-    # Counter for deleted lines to track how much "junk" we removed
     deleted_lines_count = 0
     already_indexed_count = 0
 
@@ -258,17 +389,13 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             relative_path = md_file.relative_to(markdown_path)
             relative_path_str = str(relative_path)
 
-            # Extract domain (use force_domain if provided, otherwise first directory in path)
             if force_domain:
                 domain = force_domain
-                # When force_domain is used, create tracking key with domain prefix
                 tracking_key = f"{domain}/{relative_path_str}"
             else:
                 domain = relative_path.parts[0] if relative_path.parts else "unknown"
-                # Normal case: relative path already includes domain
                 tracking_key = relative_path_str
 
-            # Check if this file was already indexed
             if indexed_files and tracking_key in indexed_files:
                 already_indexed_count += 1
                 continue
@@ -277,22 +404,25 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
                 raw_content = f.read()
 
             # ---------------------------------------------------------
-            # 🔴 AGGRESSIVE FILTER: Remove lines > 1000 chars
+            # 1. Filter: Remove lines > 1000 chars
             # ---------------------------------------------------------
             lines = raw_content.split('\n')
             clean_lines = []
             for line in lines:
                 if len(line) > 1000:
                     deleted_lines_count += 1
-                    continue  # Skip this massive line entirely
+                    continue
                 clean_lines.append(line)
 
             content = '\n'.join(clean_lines)
+            
+            # ---------------------------------------------------------
+            # 2. Filter: Clean garbage text (base64, etc)
+            # ---------------------------------------------------------
+            content = clean_garbage_text(content)
 
-            # Skip empty files (or files that became empty after filtering)
             if not content.strip():
                 continue
-            # ---------------------------------------------------------
 
             # Get URL from mappings
             url = None
@@ -300,20 +430,14 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             if domain_mappings and domain in domain_mappings:
                 base_url = domain_mappings[domain]
 
-                # Determine page_path based on whether we're using force_domain
                 if force_domain:
-                    # When using force_domain, use the entire relative path
-                    # because the domain is not in the path structure
                     page_path = str(relative_path).replace('.md', '.html')
-                    # If base_path is provided, prepend it
                     if base_path:
                         page_path = base_path.rstrip('/') + '/' + page_path
                 elif len(relative_path.parts) > 1:
-                    # Normal case: skip the first part (domain) and use the rest
                     page_path = '/'.join(relative_path.parts[1:])
                     page_path = page_path.replace('.md', '.html')
                 else:
-                    # Just the domain, no subpath
                     url = base_url
                     url_preview = base_url
                     page_path = None
@@ -340,13 +464,13 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
                 retrieval_date_str = retrieval_date.isoformat() if retrieval_date else None
 
             title = md_file.stem
-            for line in content.split('\n')[:5]:  # Only check first 5 lines for title
+            for line in content.split('\n')[:5]:
                 if line.strip().startswith('# '):
                     title = line.strip().replace('# ', '')
                     break
 
             metadata = {
-                "file_path": tracking_key,  # Use tracking_key for consistent identification
+                "file_path": tracking_key,
                 "file_name": md_file.name,
                 "domain": domain,
                 "title": title,
@@ -371,7 +495,7 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             print(f"Error processing {md_file}: {e}")
             continue
 
-    print(f"⚠️ Filtered out {deleted_lines_count} massive lines (>1000 chars) during loading.")
+    print(f"⚠️ Filtered out {deleted_lines_count} massive lines (>1000 chars).")
     if already_indexed_count > 0:
         print(f"ℹ️ Skipped {already_indexed_count} already indexed files")
     return documents, already_indexed_count
@@ -383,285 +507,127 @@ def index_markdown_to_elasticsearch(
     es_url="https://es.swissai.cscs.ch",
     mappings_path=None,
     timestamps_path=None,
-    embedding_model="nomic-embed-text",
-    chunk_size=512,
-    chunk_overlap=64,
-    clean_index=False,
-    save_json=False,
-    json_output_path=None,
     es_user="lsaie-1",
     es_password=None,
     force_domain=None,
     base_path=None,
-    indexed_files_path=None
+    indexed_files_path=None,
+    **kwargs
 ):
-    """
-    Index markdown files to Elasticsearch with embeddings.
-    Uses a safe, decoupled approach: split → embed → upload in slices.
-
-    Args:
-        markdown_dir (str): Directory containing markdown files
-        index_name (str): Name of Elasticsearch index
-        es_url (str): Elasticsearch URL
-        mappings_path (str, optional): Path to domain mappings JSON file
-        timestamps_path (str, optional): Path to timestamps JSON file from combine_domains
-        embedding_model (str): Embedding model name (for display only, actual model is remote)
-        chunk_size (int): Size of text chunks for splitting
-        chunk_overlap (int): Overlap between chunks
-        clean_index (bool): Whether to delete existing index before indexing
-        save_json (bool): Whether to save documents to JSON for inspection
-        json_output_path (str, optional): Path for JSON output file
-        es_user (str): Elasticsearch username
-        es_password (str, optional): Elasticsearch password
-        force_domain (str, optional): Force a specific domain instead of extracting from path
-        base_path (str, optional): Base path to prepend to URLs (e.g., "staffnet/de")
-        indexed_files_path (str, optional): Path to JSON file tracking already indexed files
-
-    Returns:
-        dict: Summary with 'documents_loaded', 'documents_indexed', 'already_indexed'
-    """
-    # --- SETUP & LOGGING ---
+    # Detect Resources
+    num_workers = get_slurm_cores()
+    
     print("=" * 70)
-    sys.stdout.flush()
-    print("Elasticsearch Indexing Pipeline (Safe Mode: Decoupled + Sliced Uploads)")
-    print(f"Index name:   {index_name}")
-    print(f"Chunk Size:   {chunk_size}")
+    print("🚀 SUPERCOMPUTER PARALLEL INDEXER")
+    print(f"   Detected Cores: {num_workers}")
     print("=" * 70)
-    sys.stdout.flush()
 
-    is_local = "127.0.0.1" in es_url or "localhost" in es_url
-    if not is_local and (not es_user or not es_password):
-        raise ValueError("Elasticsearch credentials required for remote server.")
-
-    if clean_index:
-        clean_elasticsearch_index(index_name, es_url, es_user, es_password)
-
-    # --- LOAD INDEXED FILES TRACKING ---
-    if not indexed_files_path:
-        # Set default path if not provided
+    # 1. Load Tracking Data
+    if not indexed_files_path: 
         indexed_files_path = f"output/{index_name}_indexed_files.json"
-    indexed_files = load_indexed_files(indexed_files_path)
+    
+    indexed_files = set()
+    if Path(indexed_files_path).exists():
+        with open(indexed_files_path, 'r') as f:
+            indexed_files = set(json.load(f))
+    print(f"Already indexed: {len(indexed_files)} files")
 
-    # --- LOAD DOCUMENTS ---
-    domain_mappings = load_domain_mappings(mappings_path) if mappings_path else None
-    timestamps = load_timestamps(timestamps_path) if timestamps_path else None
+    domain_mappings = {}
+    if mappings_path:
+        with open(mappings_path, 'r') as f: domain_mappings = json.load(f)
+        
+    timestamps = {}
+    if timestamps_path:
+        with open(timestamps_path, 'r') as f: timestamps = json.load(f)
 
-    print("\nLoading documents...")
-    sys.stdout.flush()
-    documents, already_indexed = get_documents_from_markdown_files(
-        markdown_dir, domain_mappings, timestamps, force_domain, base_path, indexed_files
-    )
-    print(f"Documents loaded: {len(documents)}")
-    sys.stdout.flush()
-
-    if not documents:
-        print("No documents found!")
-        sys.stdout.flush()
-        return {'documents_loaded': 0, 'documents_indexed': 0, 'already_indexed': already_indexed}
-
-    # --- DEBUG JSON SAVE ---
-    if save_json:
-        if json_output_path is None:
-            json_output_path = f"output/{index_name}_documents.json"
-        print(f"Saving debug JSON to {json_output_path}...")
-        sys.stdout.flush()
-        save_documents_to_json(documents, json_output_path)
-        print("JSON saved.")
-        sys.stdout.flush()
-
-    # --- ES CONNECTION ---
-    print("\nConnecting to Elasticsearch...")
-    sys.stdout.flush()
-    if is_local:
-        es_vector_store = ElasticsearchStore(
-            index_name=index_name,
-            vector_field="doc_vector",
-            text_field="content",
-            es_url=es_url,
-            batch_size=50  # Batch 50 nodes per upload for speed
-        )
-    else:
-        es_vector_store = ElasticsearchStore(
-            index_name=index_name,
-            vector_field="doc_vector",
-            text_field="content",
-            es_url=es_url,
-            es_user=es_user,
-            es_password=es_password,
-            batch_size=50  # Batch 50 nodes per upload for speed
-        )
-
-    # --- EMBEDDING SERVICE ---
-    embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
-    if not embedding_service_url:
-        raise ValueError("EMBEDDING_SERVICE_URL not set")
-    remote_embedding = RemoteEmbedding(service_url=embedding_service_url, timeout=300.0)
-    print(f"✓ Connected to services")
-    sys.stdout.flush()
-
-    # --- PIPELINE SETUP (SPLITTER ONLY) ---
-    # We purposefully do NOT include remote_embedding here. We run it manually.
-    splitter_pipeline = IngestionPipeline(
-        transformations=[
-            SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap),
-        ]
-    )
-
-    doc_batch_size = 10  # Process 10 files at a time for better speed
-    total_processed = 0
-    total_skipped = 0
-
-    # Intermediate save configuration
-    save_interval = 200  # Save tracking file every 200 documents
-    last_save_count = 0
-
-    # Track successfully indexed files
-    if indexed_files is None:
-        indexed_files = set()
-    newly_indexed_files = set()
-
-    print(f"\nStarting processing of {len(documents)} documents...")
-    sys.stdout.flush()
-
-    # --- MAIN LOOP WITH TQDM ---
-    for i in tqdm(range(0, len(documents), doc_batch_size), desc="Indexing", file=sys.stdout, mininterval=5.0):
-        if i % 10 == 0:
-            print("At iteration " + str(i) + " skipped files: " + str(total_skipped))
-        batch = documents[i:i+doc_batch_size]
-
+    # 2. Gather Files
+    print("Scanning files...")
+    all_md_files = sorted(list(Path(markdown_dir).rglob("*.md")))
+    
+    files_to_process = []
+    base_dir_path = Path(markdown_dir)
+    
+    # Pre-filter
+    for f in all_md_files:
         try:
-            # -------------------------------------------------
-            # STEP 1: SPLIT (Local CPU only)
-            # -------------------------------------------------
-            nodes = run_transformations(
-                nodes=batch,
-                transformations=splitter_pipeline.transformations,
-                show_progress=False
-            )
+            rel_p = f.relative_to(base_dir_path)
+            key = f"{force_domain}/{rel_p}" if force_domain else str(rel_p)
+            if key not in indexed_files:
+                files_to_process.append(str(f))
+        except:
+            pass
 
-            if not nodes:
-                continue
+    print(f"Files to process: {len(files_to_process)}")
+    if not files_to_process: 
+        return
 
-            valid_nodes = []
+    # 3. Initialize ES Connection (Main Process Only)
+    es_store = ElasticsearchStore(
+        index_name=index_name,
+        es_url=es_url,
+        es_user=es_user,
+        es_password=es_password,
+        batch_size=50
+    )
 
-            # -------------------------------------------------
-            # STEP 2: EMBED (Network Call - Batched)
-            # -------------------------------------------------
-            # Filter out nodes that are too large
-            embeddable_nodes = []
-            skipped_too_large = 0
-            for node in nodes:
-                content_str = node.get_content()
-                # Safety Check: Size
-                # Model has 2048 token limit for ENTIRE REQUEST (all texts combined)
-                # With batch_size=10, we process more docs but embed nodes individually
-                # Conservative estimate: ~3 chars/token → 5000 chars max per text for safety
-                if len(content_str) > 5000:
-                    print("too large")
-                    skipped_too_large += 1
-                    continue
-                embeddable_nodes.append(node)
+    # 4. Create Tasks
+    FILES_PER_TASK = 10
+    tasks = []
+    
+    for i in range(0, len(files_to_process), FILES_PER_TASK):
+        batch = files_to_process[i:i+FILES_PER_TASK]
+        payload = (batch, str(markdown_dir), domain_mappings, timestamps, 
+                   force_domain, base_path)
+        tasks.append(payload)
 
-            if skipped_too_large > 0:
-                print(f"\n⚠️ Skipped {skipped_too_large} chunks that exceed embedding model token limit")
-                sys.stdout.flush()
+    # 5. Execute Parallel Pipeline
+    total_indexed_nodes = 0
+    newly_indexed_files = set()
+    save_counter = 0
 
-            # Batch embed synchronously in sub-batches to avoid token limit
-            if embeddable_nodes:
-                try:
-                    # Split into sub-batches of 3 nodes each to stay under 2048 token limit
-                    # With 5000 chars max per node (~1666 tokens), 3 nodes = ~5000 tokens
-                    # But in practice chunks are smaller, so 3 is safe
-                    sub_batch_size = 3
-
-                    for sub_idx in range(0, len(embeddable_nodes), sub_batch_size):
-                        sub_batch = embeddable_nodes[sub_idx:sub_idx + sub_batch_size]
-                        texts = [node.get_content() for node in sub_batch]
-                        embeddings = remote_embedding._get_text_embeddings(texts)
-
-                        # Assign embeddings to nodes
-                        for node, embedding in zip(sub_batch, embeddings):
-                            node.embedding = embedding
-                            valid_nodes.append(node)
-
-                except Exception as e_embed:
-                    print(f"\nBatch embedding failed for doc batch {i}")
-                    print(f"error: {e_embed}")
-                    # Skip this entire batch if embedding fails
-                    continue
-
-            if not valid_nodes:
-                print("not valid nodes")
-                total_skipped += len(batch)
-                continue
-
-            # -------------------------------------------------
-            # STEP 3: UPLOAD (Sliced to avoid 413 Body Too Large)
-            # -------------------------------------------------
-            # We slice the list of nodes into mini-batches of 20.
-            # This ensures the JSON payload sent to ES is never > 1MB.
-            upload_slice_size = 20
-            upload_failed = False
-
-            for u_idx in range(0, len(valid_nodes), upload_slice_size):
-                sub_batch = valid_nodes[u_idx : u_idx + upload_slice_size]
-                try:
-                    es_vector_store.add(sub_batch)
-                except Exception as e_upload:
-                    print(f"\n⚠️ Upload failed for slice {u_idx} in batch {i}")
-                    print(f"error: {e_upload}")
-                    sys.stdout.flush()
-                    upload_failed = True
-                    continue  # Try the next slice
-
-            # Track successfully indexed files from this batch
-            # Only add to tracking if upload succeeded for all slices
-            if not upload_failed:
-                for doc in batch:
-                    file_path = doc.metadata.get('file_path')
-                    if file_path:
-                        newly_indexed_files.add(file_path)
-
-            total_processed += len(batch)
-
-            # Intermediate save: save tracking file every save_interval documents
-            if total_processed - last_save_count >= save_interval:
-                if indexed_files_path and newly_indexed_files:
-                    all_indexed_files = indexed_files.union(newly_indexed_files)
-                    save_indexed_files(all_indexed_files, indexed_files_path)
-                    last_save_count = total_processed
-                    print(f"\n💾 Intermediate save: {len(all_indexed_files)} files tracked")
-                    sys.stdout.flush()
-
-        except Exception as e:
-            print(f"\n❌ CRASH in file index {i}")
-            print(f"Error: {e}")
-            sys.stdout.flush()
-            total_skipped += len(batch)
-            continue
-
-    print("\n" + "=" * 70)
+    print(f"Dispatching {len(tasks)} tasks to {num_workers} workers...")
     sys.stdout.flush()
-    print(f"✓ FINISHED.")
-    print(f"  Indexed: {total_processed}")
-    print(f"  Skipped: {total_skipped}")
-    print(f"  Already indexed: {already_indexed}")
-    print("=" * 70)
-    sys.stdout.flush()
+    
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all
+        futures = {executor.submit(worker_process_batch, t): t for t in tasks}
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Indexing"):
+            try:
+                nodes = future.result()
+                
+                if nodes:
+                    # Upload to ES (Sliced)
+                    SLICE = 20
+                    for k in range(0, len(nodes), SLICE):
+                        es_store.add(nodes[k:k+SLICE])
+                    
+                    total_indexed_nodes += len(nodes)
 
-    # Save the updated indexed files list
-    if indexed_files_path and newly_indexed_files:
-        all_indexed_files = indexed_files.union(newly_indexed_files)
-        save_indexed_files(all_indexed_files, indexed_files_path)
+                    # Track success
+                    for node in nodes:
+                        fp = node.metadata.get('file_path')
+                        if fp: newly_indexed_files.add(fp)
+                
+                # Incremental Save
+                save_counter += 1
+                if save_counter % 50 == 0:
+                    combined = indexed_files.union(newly_indexed_files)
+                    with open(indexed_files_path, 'w') as f:
+                        json.dump(sorted(list(combined)), f, indent=2)
 
+            except Exception as e:
+                print(f"❌ Worker Error: {e}")
+
+    # Final Save
+    combined = indexed_files.union(newly_indexed_files)
+    with open(indexed_files_path, 'w') as f:
+        json.dump(sorted(list(combined)), f, indent=2)
+
+    print(f"\n🎉 DONE. Indexed {total_indexed_nodes} chunks from {len(newly_indexed_files)} files.")
+    
     try:
-        if hasattr(es_vector_store, 'close'):
-            es_vector_store.close()
+        if hasattr(es_store, 'client'):
+            es_store.client.close()
     except:
         pass
-
-    return {
-        'documents_loaded': len(documents),
-        'documents_indexed': total_processed,
-        'already_indexed': already_indexed
-    }
