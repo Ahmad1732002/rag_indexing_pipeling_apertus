@@ -566,17 +566,23 @@ def index_markdown_to_elasticsearch(
                 print(f"\n⚠️ Skipped {skipped_too_large} chunks that exceed embedding model token limit")
                 sys.stdout.flush()
 
-            # Batch embed synchronously
+            # Batch embed synchronously in sub-batches to avoid token limit
             if embeddable_nodes:
                 try:
-                    # Process all embeddable nodes at once
-                    texts = [node.get_content() for node in embeddable_nodes]
-                    embeddings = remote_embedding._get_text_embeddings(texts)
+                    # Split into sub-batches of 3 nodes each to stay under 2048 token limit
+                    # With 5000 chars max per node (~1666 tokens), 3 nodes = ~5000 tokens
+                    # But in practice chunks are smaller, so 3 is safe
+                    sub_batch_size = 3
 
-                    # Assign embeddings to nodes
-                    for node, embedding in zip(embeddable_nodes, embeddings):
-                        node.embedding = embedding
-                        valid_nodes.append(node)
+                    for sub_idx in range(0, len(embeddable_nodes), sub_batch_size):
+                        sub_batch = embeddable_nodes[sub_idx:sub_idx + sub_batch_size]
+                        texts = [node.get_content() for node in sub_batch]
+                        embeddings = remote_embedding._get_text_embeddings(texts)
+
+                        # Assign embeddings to nodes
+                        for node, embedding in zip(sub_batch, embeddings):
+                            node.embedding = embedding
+                            valid_nodes.append(node)
 
                 except Exception as e_embed:
                     print(f"\nBatch embedding failed for doc batch {i}")
@@ -595,6 +601,7 @@ def index_markdown_to_elasticsearch(
             # We slice the list of nodes into mini-batches of 20.
             # This ensures the JSON payload sent to ES is never > 1MB.
             upload_slice_size = 20
+            upload_failed = False
 
             for u_idx in range(0, len(valid_nodes), upload_slice_size):
                 sub_batch = valid_nodes[u_idx : u_idx + upload_slice_size]
@@ -604,13 +611,16 @@ def index_markdown_to_elasticsearch(
                     print(f"\n⚠️ Upload failed for slice {u_idx} in batch {i}")
                     print(f"error: {e_upload}")
                     sys.stdout.flush()
+                    upload_failed = True
                     continue  # Try the next slice
 
             # Track successfully indexed files from this batch
-            for doc in batch:
-                file_path = doc.metadata.get('file_path')
-                if file_path:
-                    newly_indexed_files.add(file_path)
+            # Only add to tracking if upload succeeded for all slices
+            if not upload_failed:
+                for doc in batch:
+                    file_path = doc.metadata.get('file_path')
+                    if file_path:
+                        newly_indexed_files.add(file_path)
 
             total_processed += len(batch)
 
