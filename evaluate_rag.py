@@ -33,12 +33,14 @@ def normalize_url(url):
     Handles:
     - Removes fragments (#...)
     - Removes trailing slashes
-    - Removes index.html
+    - Removes index.html/index.htm
+    - Strips file extensions (.html, .htm, .pdf, .md) for suffix-invariant matching
     - Lowercases
-    - Removes query parameters (optional)
+    - Removes query parameters
 
     Examples:
-        https://ethz.ch/staffnet/en/page.html#section -> https://ethz.ch/staffnet/en/page.html
+        https://ethz.ch/page.pdf -> https://ethz.ch/page
+        https://ethz.ch/page.html -> https://ethz.ch/page
         https://ethz.ch/services/ -> https://ethz.ch/services
         https://ethz.ch/index.html -> https://ethz.ch
     """
@@ -70,11 +72,18 @@ def normalize_url(url):
     if normalized.endswith('/'):
         normalized = normalized[:-1]
 
-    # Remove /index.html at the end
+    # Remove /index.html or /index.htm at the end
     if normalized.endswith('/index.html'):
         normalized = normalized[:-11]
     elif normalized.endswith('/index.htm'):
         normalized = normalized[:-10]
+
+    # Strip file extensions for suffix-invariant matching
+    # This handles cases where .pdf was indexed as .html
+    for ext in ['.html', '.htm', '.pdf', '.md']:
+        if normalized.endswith(ext):
+            normalized = normalized[:-len(ext)]
+            break
 
     return normalized
 
@@ -322,20 +331,55 @@ def main():
     print()
 
     for i, (question, relevant_docs) in enumerate(questions_data, start=1):
-        print(f"[{i}/{len(questions_data)}] Evaluating: {question[:80]}...")
+        print(f"[{i}/{len(questions_data)}] {question[:80]}...")
 
         result = evaluate_question(question, relevant_docs, es_config, args.top_k)
         results.append(result)
 
+        # Extract domains from relevant docs (what we're looking for)
+        for doc_url in relevant_docs:
+            try:
+                parsed = urlparse(doc_url)
+                domain = parsed.netloc.lower()
+                print(f"  Looking for: {domain}")
+            except:
+                print(f"  Looking for: {doc_url}")
+
+        # Extract domains from search results (what we found)
+        if result.get('retrieved_count', 0) > 0:
+            found_domains = set()
+            # Get domains from the search (need to re-query or store in result)
+            try:
+                search_results = simple_search(
+                    query=question,
+                    index_name=es_config['index_name'],
+                    es_url=es_config['es_url'],
+                    top_k=min(10, args.top_k),  # Just check first 10 for display
+                    es_user=es_config['es_user'],
+                    es_password=es_config['es_password']
+                )
+                for sr in search_results:
+                    url = sr.get('url') or sr.get('url_preview')
+                    if url:
+                        try:
+                            parsed = urlparse(url)
+                            found_domains.add(parsed.netloc.lower())
+                        except:
+                            pass
+                if found_domains:
+                    print(f"  Found domains: {', '.join(sorted(found_domains))}")
+                else:
+                    print(f"  Found domains: (none)")
+            except Exception as e:
+                print(f"  Found domains: (error: {e})")
+        else:
+            print(f"  Found domains: (no results)")
+
         if result['success']:
             successful += 1
-            print(f"  ✓ SUCCESS - Found all {len(relevant_docs)} relevant docs")
+            print(f"  ✓ SUCCESS")
         else:
-            print(f"  ✗ FAILURE - Found {len(result['found_docs'])}/{len(relevant_docs)} docs")
-            print(f"    Missing: {result['missing_docs']}")
-
-        if result['rank_of_first_match']:
-            print(f"  First match at rank: {result['rank_of_first_match']}")
+            print(f"  ✗ FAILURE")
 
         total_relevant_docs += len(relevant_docs)
         total_found_docs += len(result['found_docs'])

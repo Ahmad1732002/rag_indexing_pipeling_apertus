@@ -104,19 +104,22 @@ def worker_process_batch(task_payload):
     """
     The Worker Function (runs in separate process).
     Handles: Load -> Clean -> Metadata/URL Gen -> Split -> Embed.
+    Returns: (processed_nodes, skipped_count)
     """
     (file_paths, base_dir, domain_mappings, timestamps, 
      force_domain, base_path) = task_payload
 
     embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
     if not embedding_service_url:
-        return [] 
+        print(f"❌ [Worker Error] EMBEDDING_SERVICE_URL not set")
+        return [], len(file_paths)
     
     # Each process creates its OWN connection pool
     remote_embed = RemoteEmbedding(service_url=embedding_service_url, timeout=300.0)
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=OVERLAP)
     
     processed_nodes = [] 
+    skipped_count = 0
 
     for f_path_str in file_paths:
         try:
@@ -127,6 +130,8 @@ def worker_process_batch(task_payload):
             try:
                 relative_path = f_path.relative_to(base_path_obj)
             except ValueError:
+                print(f"⚠️ [Skip] Path issue for {f_path.name}")
+                skipped_count += 1
                 continue 
 
             relative_path_str = str(relative_path)
@@ -139,8 +144,13 @@ def worker_process_batch(task_payload):
                 domain = relative_path.parts[0] if relative_path.parts else "unknown"
                 tracking_key = relative_path_str
 
-            with open(f_path, 'r', encoding='utf-8') as f:
-                raw = f.read()
+            try:
+                with open(f_path, 'r', encoding='utf-8') as f:
+                    raw = f.read()
+            except Exception as e:
+                print(f"❌ [Read Error] {f_path.name}: {e}")
+                skipped_count += 1
+                continue
 
             # Fast line filtering
             lines = [L for L in raw.split('\n') if len(L) <= 1000]
@@ -148,6 +158,8 @@ def worker_process_batch(task_payload):
             content = clean_garbage_text(content)
             
             if not content.strip():
+                # Not an error, just empty
+                skipped_count += 1
                 continue
 
             # --- Metadata & URL Logic (CRITICAL RESTORATION) ---
@@ -210,6 +222,7 @@ def worker_process_batch(task_payload):
             # --- Split ---
             nodes = splitter.get_nodes_from_documents([doc])
             if not nodes:
+                skipped_count += 1
                 continue
 
             # --- Embed (Network IO) ---
@@ -219,6 +232,8 @@ def worker_process_batch(task_payload):
                 embeddings = adaptive_get_embeddings(remote_embed, node_texts)
                 
                 if len(embeddings) != len(nodes):
+                    print(f"❌ [Embed Error] {f_path.name}: Mismatch (nodes={len(nodes)}, embs={len(embeddings)})")
+                    skipped_count += 1
                     continue 
 
                 valid_nodes = []
@@ -228,13 +243,17 @@ def worker_process_batch(task_payload):
                 
                 processed_nodes.extend(valid_nodes)
 
-            except Exception:
+            except Exception as e:
+                print(f"❌ [Embed Fail] {f_path.name}: {e}")
+                skipped_count += 1
                 continue
 
-        except Exception:
+        except Exception as e:
+            print(f"❌ [Unknown Error] {f_path_str}: {e}")
+            skipped_count += 1
             continue
 
-    return processed_nodes
+    return processed_nodes, skipped_count
 
 
 def extract_timestamp_from_path(file_path):
@@ -582,6 +601,7 @@ def index_markdown_to_elasticsearch(
 
     # 5. Execute Parallel Pipeline
     total_indexed_nodes = 0
+    total_skipped_files = 0
     newly_indexed_files = set()
     save_counter = 0
 
@@ -594,7 +614,9 @@ def index_markdown_to_elasticsearch(
         
         for future in tqdm(as_completed(futures), total=len(futures), desc="Indexing"):
             try:
-                nodes = future.result()
+                # Unpack result
+                nodes, skipped_count = future.result()
+                total_skipped_files += skipped_count
                 
                 if nodes:
                     # Upload to ES (Sliced)
@@ -615,16 +637,25 @@ def index_markdown_to_elasticsearch(
                     combined = indexed_files.union(newly_indexed_files)
                     with open(indexed_files_path, 'w') as f:
                         json.dump(sorted(list(combined)), f, indent=2)
+                    print(f"\n💾 Checkpoint saved. Indexed: {len(combined)}, Skipped so far: {total_skipped_files}")
 
             except Exception as e:
-                print(f"❌ Worker Error: {e}")
+                print(f"\n❌ [Batch Crash] Worker failed: {e}")
+                # We assume all files in this task failed
+                total_skipped_files += FILES_PER_TASK
 
     # Final Save
     combined = indexed_files.union(newly_indexed_files)
     with open(indexed_files_path, 'w') as f:
         json.dump(sorted(list(combined)), f, indent=2)
 
-    print(f"\n🎉 DONE. Indexed {total_indexed_nodes} chunks from {len(newly_indexed_files)} files.")
+    print(f"\n" + "="*70)
+    print(f"🎉 DONE.")
+    print(f"  Indexed Nodes:  {total_indexed_nodes}")
+    print(f"  Files Indexed:  {len(newly_indexed_files)} (Session)")
+    print(f"  Files Skipped:  {total_skipped_files}")
+    print(f"  Total Tracked:  {len(combined)}")
+    print("="*70)
     
     try:
         if hasattr(es_store, 'client'):
