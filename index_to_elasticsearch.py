@@ -638,9 +638,11 @@ def index_markdown_to_elasticsearch(
                     with open(indexed_files_path, 'w') as f:
                         json.dump(sorted(list(combined)), f, indent=2)
                     print(f"\n💾 Checkpoint saved. Indexed: {len(combined)}, Skipped so far: {total_skipped_files}")
+                    sys.stdout.flush()
 
             except Exception as e:
                 print(f"\n❌ [Batch Crash] Worker failed: {e}")
+                sys.stdout.flush()
                 # We assume all files in this task failed
                 total_skipped_files += FILES_PER_TASK
 
