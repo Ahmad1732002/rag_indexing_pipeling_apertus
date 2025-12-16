@@ -507,6 +507,10 @@ def index_markdown_to_elasticsearch(
     total_processed = 0
     total_skipped = 0
 
+    # Intermediate save configuration
+    save_interval = 200  # Save tracking file every 200 documents
+    last_save_count = 0
+
     # Track successfully indexed files
     if indexed_files is None:
         indexed_files = set()
@@ -595,6 +599,15 @@ def index_markdown_to_elasticsearch(
                     newly_indexed_files.add(file_path)
 
             total_processed += len(batch)
+
+            # Intermediate save: save tracking file every save_interval documents
+            if total_processed - last_save_count >= save_interval:
+                if indexed_files_path and newly_indexed_files:
+                    all_indexed_files = indexed_files.union(newly_indexed_files)
+                    save_indexed_files(all_indexed_files, indexed_files_path)
+                    last_save_count = total_processed
+                    print(f"\n💾 Intermediate save: {len(all_indexed_files)} files tracked")
+                    sys.stdout.flush()
 
         except Exception as e:
             print(f"\n❌ CRASH in file index {i}")
