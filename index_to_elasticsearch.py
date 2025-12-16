@@ -303,7 +303,7 @@ def index_markdown_to_elasticsearch(
     embedding_model="nomic-embed-text",
     chunk_size=512,
     chunk_overlap=64,
-    clean_index=True,
+    clean_index=False,
     save_json=False,
     json_output_path=None,
     es_user="lsaie-1",
@@ -385,7 +385,7 @@ def index_markdown_to_elasticsearch(
             vector_field="doc_vector",
             text_field="content",
             es_url=es_url,
-            batch_size=1  # Keep at 1 for safety
+            batch_size=50  # Batch 50 nodes per upload for speed
         )
     else:
         es_vector_store = ElasticsearchStore(
@@ -395,7 +395,7 @@ def index_markdown_to_elasticsearch(
             es_url=es_url,
             es_user=es_user,
             es_password=es_password,
-            batch_size=1
+            batch_size=50  # Batch 50 nodes per upload for speed
         )
 
     # --- EMBEDDING SERVICE ---
@@ -414,7 +414,7 @@ def index_markdown_to_elasticsearch(
         ]
     )
 
-    doc_batch_size = 1  # Process 1 file at a time (safest for debugging)
+    doc_batch_size = 5  # Process 5 files at a time for better speed
     total_processed = 0
     total_skipped = 0
 
@@ -443,25 +443,33 @@ def index_markdown_to_elasticsearch(
             valid_nodes = []
 
             # -------------------------------------------------
-            # STEP 2: EMBED (Network Call - One by One)
+            # STEP 2: EMBED (Network Call - Batched)
             # -------------------------------------------------
+            # Filter out nodes that are too large
+            embeddable_nodes = []
             for node in nodes:
+                content_str = node.get_content()
+                # Safety Check: Size
+                if len(content_str) > 500_000:
+                    # 500k chars is ~1MB. Too big for embedding model context usually.
+                    continue
+                embeddable_nodes.append(node)
+
+            # Batch embed all valid nodes at once
+            if embeddable_nodes:
                 try:
-                    content_str = node.get_content()
+                    texts = [node.get_content() for node in embeddable_nodes]
+                    embeddings = remote_embedding._get_text_embeddings(texts)
 
-                    # Safety Check: Size
-                    if len(content_str) > 500_000:
-                        # 500k chars is ~1MB. Too big for embedding model context usually.
-                        continue
-
-                    # Manual Embed
-                    node.embedding = remote_embedding.get_text_embedding(content_str)
-                    valid_nodes.append(node)
+                    # Assign embeddings to nodes
+                    for node, embedding in zip(embeddable_nodes, embeddings):
+                        node.embedding = embedding
+                        valid_nodes.append(node)
 
                 except Exception as e_embed:
-                    print(f"\nEmbedding failed for chunk {node_idx} in doc {i}")
+                    print(f"\nBatch embedding failed for doc batch {i}")
                     print(f"error: {e_embed}")
-                    # If embedding fails for one chunk, just skip that chunk
+                    # Skip this entire batch if embedding fails
                     continue
 
             if not valid_nodes:
