@@ -41,6 +41,7 @@ from llama_index.vector_stores.elasticsearch import ElasticsearchStore
 from remote_embedding import RemoteEmbedding
 import os
 import warnings
+import asyncio
 
 
 def extract_timestamp_from_path(file_path):
@@ -564,16 +565,44 @@ def index_markdown_to_elasticsearch(
                 print(f"\n⚠️ Skipped {skipped_too_large} chunks that exceed embedding model token limit")
                 sys.stdout.flush()
 
-            # Batch embed all valid nodes at once
+            # Batch embed with concurrent async requests
             if embeddable_nodes:
                 try:
-                    texts = [node.get_content() for node in embeddable_nodes]
-                    embeddings = remote_embedding._get_text_embeddings(texts)
+                    # Split into sub-batches for concurrent processing
+                    # Process 10 texts per request, with up to 5 concurrent requests
+                    sub_batch_size = 10
+                    max_concurrent = 5
+
+                    async def embed_with_concurrency():
+                        semaphore = asyncio.Semaphore(max_concurrent)
+
+                        async def embed_sub_batch(start_idx):
+                            async with semaphore:
+                                end_idx = min(start_idx + sub_batch_size, len(embeddable_nodes))
+                                sub_batch = embeddable_nodes[start_idx:end_idx]
+                                texts = [node.get_content() for node in sub_batch]
+                                embeddings = await remote_embedding._aget_text_embeddings(texts)
+                                return start_idx, embeddings
+
+                        # Create tasks for all sub-batches
+                        tasks = []
+                        for start_idx in range(0, len(embeddable_nodes), sub_batch_size):
+                            tasks.append(embed_sub_batch(start_idx))
+
+                        # Execute all tasks concurrently
+                        results = await asyncio.gather(*tasks)
+                        return results
+
+                    # Run async embedding
+                    results = asyncio.run(embed_with_concurrency())
 
                     # Assign embeddings to nodes
-                    for node, embedding in zip(embeddable_nodes, embeddings):
-                        node.embedding = embedding
-                        valid_nodes.append(node)
+                    for start_idx, embeddings in results:
+                        end_idx = min(start_idx + sub_batch_size, len(embeddable_nodes))
+                        sub_batch = embeddable_nodes[start_idx:end_idx]
+                        for node, embedding in zip(sub_batch, embeddings):
+                            node.embedding = embedding
+                            valid_nodes.append(node)
 
                 except Exception as e_embed:
                     print(f"\nBatch embedding failed for doc batch {i}")
