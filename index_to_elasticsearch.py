@@ -549,13 +549,20 @@ def index_markdown_to_elasticsearch(
             # -------------------------------------------------
             # Filter out nodes that are too large
             embeddable_nodes = []
+            skipped_too_large = 0
             for node in nodes:
                 content_str = node.get_content()
                 # Safety Check: Size
-                if len(content_str) > 500_000:
-                    # 500k chars is ~1MB. Too big for embedding model context usually.
+                # Model has 2048 token limit. Rough estimate: 4 chars/token = ~8000 chars max
+                # Use 7000 chars to be safe (leaves room for ~1750 tokens)
+                if len(content_str) > 7300:
+                    skipped_too_large += 1
                     continue
                 embeddable_nodes.append(node)
+
+            if skipped_too_large > 0:
+                print(f"\n⚠️ Skipped {skipped_too_large} chunks that exceed embedding model token limit")
+                sys.stdout.flush()
 
             # Batch embed all valid nodes at once
             if embeddable_nodes:
