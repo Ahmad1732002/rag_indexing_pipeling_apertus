@@ -180,24 +180,37 @@ def simple_search(
             "ELASTIC_USERNAME and ELASTIC_PASSWORD in your .env file."
         )
 
-    # Connect to Elasticsearch vector store with timeout
+    # Connect to Elasticsearch vector store with extended timeout
+    # Configure client options with longer timeout for remote connections
+    from elasticsearch import AsyncElasticsearch
+
+    # Create ES client with proper timeout configuration
     if is_local:
+        es_client = AsyncElasticsearch(
+            hosts=[es_url],
+            request_timeout=120,  # 120 seconds for request timeout
+            max_retries=3,
+            retry_on_timeout=True
+        )
         es_vector_store = ElasticsearchStore(
             index_name=index_name,
             vector_field='doc_vector',
             text_field='content',
-            es_url=es_url,
-            timeout=60  # 60 seconds timeout
+            es_client=es_client
         )
     else:
+        es_client = AsyncElasticsearch(
+            hosts=[es_url],
+            basic_auth=(es_user, es_password),
+            request_timeout=120,  # 120 seconds for request timeout
+            max_retries=3,
+            retry_on_timeout=True
+        )
         es_vector_store = ElasticsearchStore(
             index_name=index_name,
             vector_field='doc_vector',
             text_field='content',
-            es_url=es_url,
-            es_user=es_user,
-            es_password=es_password,
-            timeout=60  # 60 seconds timeout
+            es_client=es_client
         )
 
     # Create remote embedding model
