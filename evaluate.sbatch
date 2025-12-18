@@ -14,28 +14,35 @@
 set -eo pipefail
 
 # --- Argument Validation ---
-if [ -z "$1" ] || [ -z "$2" ]; then
-    echo "Usage: sbatch evaluate.sbatch <excel_path> <top_k>"
-    echo "Example: sbatch evaluate.sbatch /path/to/questions.xlsx 100"
+if [ -z "$1" ]; then
+    echo "Usage: sbatch evaluate.sbatch <excel_path> [--compare-query-expansion]"
+    echo "Example: sbatch evaluate.sbatch /path/to/questions.xlsx"
+    echo "Example: sbatch evaluate.sbatch /path/to/questions.xlsx --compare-query-expansion"
+    echo "Note: Always retrieves k=100 results and computes accuracy at k=1,3,5,10,25,50,100"
+    echo ""
+    echo "Options:"
+    echo "  --compare-query-expansion: Compare baseline retrieval with query expansion"
     exit 1
 fi
 
 EXCEL_PATH="$1"
-TOP_K="$2"
+EXTRA_ARGS="${@:2}"  # Capture all arguments after the first one
 
 echo "[sbatch] running on $(hostname)"
 echo "[sbatch] SLURM_JOB_ID: $SLURM_JOB_ID"
 echo "[sbatch] Excel path: $EXCEL_PATH"
-echo "[sbatch] Top-K: $TOP_K"
+echo "[sbatch] Top-K: 100 (fixed)"
+echo "[sbatch] Extra args: $EXTRA_ARGS"
 
 PROJECT_DIR="$SLURM_SUBMIT_DIR"
 cd "$PROJECT_DIR"
 
 echo "[sbatch] Starting evaluation..."
 
-# Run evaluation
+# Run evaluation with k=100 (always retrieves 100 results, computes accuracy at multiple k values)
 python3 evaluate_rag.py \
     --excel "$EXCEL_PATH" \
-    --top-k "$TOP_K"
+    --top-k 100 \
+    $EXTRA_ARGS
 
 echo "[sbatch] Evaluation finished successfully"

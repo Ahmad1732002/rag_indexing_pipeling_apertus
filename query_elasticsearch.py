@@ -8,6 +8,7 @@ from llama_index.core import VectorStoreIndex
 from llama_index.vector_stores.elasticsearch import ElasticsearchStore
 from llama_index.llms.ollama import Ollama
 from remote_embedding import RemoteEmbedding
+from query_expansion import expand_query
 import os
 
 # TODO
@@ -154,7 +155,9 @@ def simple_search(
     es_url="https://es.swissai.cscs.ch",
     top_k=5,
     es_user=None,
-    es_password=None
+    es_password=None,
+    use_query_expansion=False,
+    query_expansion_verbose=False
 ):
     """
     Simple semantic search without LLM response generation.
@@ -167,10 +170,24 @@ def simple_search(
         top_k (int): Number of results to return
         es_user (str, optional): Elasticsearch username (required for remote servers)
         es_password (str, optional): Elasticsearch password (required for remote servers)
+        use_query_expansion (bool): Whether to expand query before search (default: False)
+        query_expansion_verbose (bool): Whether to print query expansion details (default: False)
 
     Returns:
         list: List of dicts with document text and metadata
     """
+    # Expand query if requested
+    original_query = query
+    if use_query_expansion:
+        try:
+            query = expand_query(query, verbose=query_expansion_verbose)
+            if query_expansion_verbose:
+                print(f"\n[Query Expansion]")
+                print(f"  Original: {original_query}")
+                print(f"  Expanded: {query}")
+        except Exception as e:
+            print(f"Warning: Query expansion failed ({e}), using original query")
+            query = original_query
     # Validate credentials for remote servers
     is_local = "127.0.0.1" in es_url or "localhost" in es_url
     if not is_local and (not es_user or not es_password):
@@ -250,6 +267,12 @@ def simple_search(
             "file_path": node.metadata.get('file_path'),
         }
         results.append(result)
+
+    # Add metadata about query expansion to first result (if any)
+    if results and use_query_expansion:
+        results[0]['_query_expansion_used'] = True
+        results[0]['_original_query'] = original_query
+        results[0]['_expanded_query'] = query
 
     return results
 
